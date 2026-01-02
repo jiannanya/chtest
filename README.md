@@ -217,9 +217,8 @@ See `test/mock_tests.cpp`.
 You can pass arguments to `chtest_tests`:
 
 - `--test <pattern>`: filter by case name substring (case-insensitive)
-- `--list`: list cases/subcases (note: subcase list currently relies on discovery collection; it may be empty without prior discovery)
+- `--list`: list cases
 - `--cases`: list only cases
-- `--subcases`: list only subcases (same note as above)
 - `--repeat N`: run all tests N times
 - `--shuffle <seed>`: shuffle execution order with seed
 - `--quiet`: suppress per-check OK lines
@@ -429,10 +428,7 @@ int chtest::run(int argc, char** argv);
 #### Listing
 
 - `--cases`: list cases
-- `--subcases`: list subcases
-- `--list`: list both
-
-Note: in the current implementation, subcases are collected during discovery into `TestCase.subcases`. If you only do listing without discovery, the subcase list may be empty.
+- `--list`: list cases
 
 ### Output and thread-safety
 
@@ -528,4 +524,4 @@ Notes:
   - in discovery: assertions are recorded
   - in active replay: assertions are recorded only inside `SUBCASE` (`in_subcase == true`)
   This means assertions outside SUBCASE are typically counted only once (during discovery).
-- The current `--subcases/--list` subcase listing relies on discovery collection; listing-only runs may show an empty subcase list.
+- There is no CLI option to list subcases; subcases are discovered dynamically during execution.

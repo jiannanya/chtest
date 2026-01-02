@@ -160,7 +160,6 @@ struct Config {
     std::string pattern;
     bool list_all = false;      // --list
     bool list_cases = false;    // --cases
-    bool list_subcases = false; // --subcases
     int repeat = 1;             // --repeat N
     bool shuffle = false;       // --shuffle <seed>
     unsigned seed = 0;
@@ -1142,7 +1141,6 @@ inline Config parse_args(int argc, char** argv) {
 
         if (a == "--list") cfg.list_all = true;
         else if (a == "--cases") cfg.list_cases = true;
-        else if (a == "--subcases") cfg.list_subcases = true;
         else if (a == "--repeat") nextI(cfg.repeat);
         else if (a == "--shuffle") { cfg.shuffle = true; nextU(cfg.seed); }
         else if (a == "--quiet") cfg.quiet = true;
@@ -1179,9 +1177,8 @@ inline Config parse_args(int argc, char** argv) {
             ts_cout() <<
                 "Options:\n"
                 "  --test <pattern>   filter case names (substring, case-insensitive)\n"
-                "  --list             list all cases and subcases\n"
+                "  --list             list all cases\n"
                 "  --cases            list only case names\n"
-                "  --subcases         list only subcases\n"
                 "  --repeat N         repeat all tests N times\n"
                 "  --shuffle <seed>   shuffle order with seed\n"
                 "  --quiet            suppress per-check OK lines\n"
@@ -1276,18 +1273,10 @@ inline int run(int argc, char** argv) {
     });
 
     // Listing
-    if (cfg.list_all || cfg.list_cases || cfg.list_subcases) {
+    if (cfg.list_all || cfg.list_cases) {
         if (cfg.list_all || cfg.list_cases) {
             Color::instance().blue(); ts_cout() << "[cases]\n"; Color::instance().reset();
             for (int idx : indices) ts_cout() << "  " << tests[idx].name << "\n";
-        }
-        if (cfg.list_all || cfg.list_subcases) {
-            Color::instance().blue(); ts_cout() << "[subcases]\n"; Color::instance().reset();
-            for (int idx : indices) {
-                for (auto& sc : tests[idx].subcases) {
-                    ts_cout() << "  " << tests[idx].name << " :: " << sc.name << "\n";
-                }
-            }
         }
         return 0;
     }
