@@ -146,9 +146,6 @@ struct case_output_collector {
     case_output_collector& operator=(const case_output_collector&) = delete;
 };
 
-// (moved: helper functions for propagating case context and spawn helpers
-// are defined later, after RouteState is declared)
-
 
 // ---------- Unique name helpers ----------
 #define CH_TEST_CONCAT_INNER(a,b) a##b
@@ -246,8 +243,6 @@ TEST_CASE_IMPL(NAME, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQUE_NAME(CH_TES
 /* the above macro expands into a registrar; override below by reassigning priority */
 
 // Helper macros to register with explicit priority or retries or skip predicate
-
-
 #define TEST_CASE_WITH_OPTS_IMPL(NAME, PRIO, RETRIES, SKIP_PRED, CH_TEST_FN, CH_TEST_REG) \
     static void CH_TEST_FN(); \
     static ::chtest::TestRegistrar CH_TEST_REG{ NAME, CH_TEST_FN, false, std::vector<std::string>(), PRIO, RETRIES, SKIP_PRED }; \
@@ -420,7 +415,6 @@ std::string to_string_any(const T& v) {
 }
 
 // ---------- Result aggregation ----------
-
 template <typename T>
 class ThreadSafeVector {
 public:
