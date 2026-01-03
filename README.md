@@ -1,10 +1,23 @@
 # chtest
 
-A lightweight and  performance header only C++17 testing framework .
+A lightweight, performance，hackable, single-header C++17 testing framework.
 
 It is intentionally small and hackable: everything lives in one file (`include/chtest.hpp`), and the `test/` directory doubles as both a test suite and living documentation.
 
-Key features:
+## Contents
+
+- [Quick start](#quick-start)
+- [Feature tour](#feature-tour)
+- [Core concepts](#core-concepts)
+- [Assertions](#assertions)
+- [Parameterized tests](#parameterized-tests-test_case_param)
+- [Tags](#tags-filter-by-tags)
+- [Concurrency](#concurrency-and-assertions-in-child-threads)
+- [MockFunction](#mockfunction-simple-function-mock)
+- [Command line](#command-line-cli)
+- [API reference](#chtesthpp-api-reference)
+
+## Key features
 
 - `TEST_CASE` and two-phase `SUBCASE` (discovery + active replay)
 - Assertions: `CHECK`/`REQUIRE`, binary comparisons, exceptions, float helpers (`NEAR`/`APPROX`), container helpers (`CONTAINS`/`SIZE`/`SEQ_EQ`)
@@ -16,7 +29,7 @@ Key features:
 - Per-case output buffering + optional output sink (`set_output_sink`)
 - A simple thread-safe function mock (`chtest::MockFunction`)
 
-Project structure:
+## Project structure
 
 - Header: `include/chtest.hpp`
 - Example tests: `test/*.cpp`
@@ -69,6 +82,127 @@ Alternatively, define `CH_TEST_MAIN` in a `.cpp` to let the framework provide `m
 TEST_CASE("smoke") {
     CHECK(true);
 }
+```
+
+## Feature tour
+
+Each feature below includes one minimal example (copy/paste friendly).
+
+### 1) Define a test case
+
+```cpp
+#include "chtest.hpp"
+
+TEST_CASE("math") {
+    CHECK_EQ(1 + 1, 2);
+}
+```
+
+### 2) Branch with SUBCASE (discovery + replay)
+
+```cpp
+TEST_CASE("vector push") {
+    std::vector<int> v;
+
+    SUBCASE("one") {
+        v.push_back(1);
+        CHECK_EQ(v.size(), 1u);
+    }
+
+    SUBCASE("two") {
+        v.push_back(2);
+        CHECK_EQ(v.back(), 2);
+    }
+}
+```
+
+### 3) Assertions: basic / exceptions / float helpers
+
+```cpp
+TEST_CASE("assertions") {
+    CHECK(true);
+    REQUIRE_EQ(2 * 3, 6);
+    CHECK_THROWS(throw std::runtime_error("boom"));
+    CHECK_NEAR(0.1 + 0.2, 0.3, 1e-12);
+}
+```
+
+### 4) Parameterized tests (TEST_CASE_PARAM)
+
+```cpp
+static auto params = std::vector<std::tuple<int,int,int>>{
+    {1, 2, 3},
+    {5, 7, 12},
+};
+
+TEST_CASE_PARAM("add", params) {
+    auto [a, b, expected] = param;
+    CHECK_EQ(a + b, expected);
+}
+```
+
+### 5) Tags + filtering
+
+```cpp
+TEST_CASE_TAG("fast math", {"fast", "math"}) {
+    CHECK_EQ(10 - 3, 7);
+}
+```
+
+Run only tagged tests:
+
+```bash
+./build/chtest_tests --tag fast
+```
+
+### 6) Fixture (TEST_F)
+
+```cpp
+struct CounterFixture {
+    void setUp() { value = 0; }
+    void tearDown() {}
+    int value{};
+};
+
+TEST_F(CounterFixture, "fixture example") {
+    CHECK_EQ(value, 0);
+    value++;
+    CHECK_EQ(value, 1);
+}
+```
+
+### 7) Case-level concurrency + child-thread context
+
+```cpp
+TEST_CASE("threaded checks") {
+    auto abort = ::chtest::make_case_abort();
+
+    std::thread t = ::chtest::spawn_with_context(abort, [] {
+        THREAD_REQUIRE_EQ(1, 1);
+    });
+
+    t.join();
+}
+```
+
+### 8) Output sink (redirect output)
+
+```cpp
+chtest::set_output_sink([](std::string_view s) {
+    // forward to your logger
+    std::cerr << s;
+});
+```
+
+### 9) MockFunction
+
+```cpp
+chtest::MockFunction<int(int,int)> add;
+add.setImpl([](int a, int b) { return a + b; });
+
+CHECK_EQ(add(2, 3), 5);
+CHECK_CALLED(add);
+CHECK_CALLED_WITH(add, 2, 3);
 ```
 
 ## Core concepts
@@ -178,7 +312,7 @@ std::thread t(::chtest::with_current_case_context([] {
 }));
 ```
 
-1. Use `spawn_with_context(...)` (equivalent semantics, shorter call site):
+2. Use `spawn_with_context(...)` (equivalent semantics, shorter call site):
 
 ```cpp
 std::thread t = ::chtest::spawn_with_context([] {
@@ -428,7 +562,7 @@ int chtest::run(int argc, char** argv);
 #### Listing
 
 - `--cases`: list cases
-- `--list`: list cases
+- `--list`: list cases (alias of `--cases`)
 
 ### Output and thread-safety
 
