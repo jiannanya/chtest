@@ -162,6 +162,7 @@ struct Config {
     unsigned seed = 0;
     bool quiet = false;         // --quiet
     bool no_color = false;      // --no-color
+    bool no_buffer = false;     // --no-buffer
     int timeout_ms = 0;         // --timeout
     int threads = 1;            // --threads N
     int default_retries = 0;    // --retries N (global fallback)
@@ -1139,6 +1140,7 @@ inline Config parse_args(int argc, char** argv) {
         else if (a == "--shuffle") { cfg.shuffle = true; nextU(cfg.seed); }
         else if (a == "--quiet") cfg.quiet = true;
         else if (a == "--no-color") cfg.no_color = true;
+        else if (a == "--no-buffer") cfg.no_buffer = true;
         else if (a == "--test")nextS(cfg.pattern);
         else if (a == "--tag" || a == "--tag-any") {
             cfg.tag_mode = Config::TagMode::Any;
@@ -1177,6 +1179,7 @@ inline Config parse_args(int argc, char** argv) {
                 "  --shuffle <seed>   shuffle order with seed\n"
                 "  --quiet            suppress per-check OK lines\n"
                 "  --no-color         disable colors\n"
+                "  --no-buffer        disable per-case output buffering\n"
                 "  --tag <tag> / --tag-any <tag>   filter tests to those having any of the given tags (can repeat)\n"
                 "  --tag-all <tag>    require tests to have ALL listed tags\n"
                 "  --not-tag <tag>    exclude tests that have ANY of the listed tags\n"
@@ -1194,6 +1197,15 @@ inline int run(int argc, char** argv) {
     auto cfg = parse_args(argc, argv);
     Color::instance().set_enabled(!cfg.no_color);
     current_quiet() = cfg.quiet;
+
+    if (cfg.no_buffer) {
+        // Best-effort: ensure output is visible even if the process terminates abruptly.
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        std::ios::sync_with_stdio(true);
+        std::cout.setf(std::ios::unitbuf);
+        std::cerr.setf(std::ios::unitbuf);
+    }
 
     // Build indices with filter
     auto& tests = registry();
@@ -1287,9 +1299,14 @@ inline int run(int argc, char** argv) {
         auto worker =
             [&](int idx) {
                 auto& T = tests[idx];
-                // collect all output produced while running this case into
+                // Collect all output produced while running this case into
                 // a per-case buffer and flush it atomically at the end.
-                ::chtest::case_output_collector case_out_collector;
+                // In --no-buffer mode, write directly to stdout so output is
+                // visible even if the process hard-crashes mid-case.
+                std::unique_ptr<::chtest::case_output_collector> case_out_collector;
+                if (!cfg.no_buffer) {
+                    case_out_collector = std::make_unique<::chtest::case_output_collector>();
+                }
                 // Install a per-case abort flag and keep it alive for the
                 // duration of this case execution. child threads that
                 // inherit context will capture this shared_ptr and thus
@@ -1350,11 +1367,11 @@ inline int run(int argc, char** argv) {
                     } catch (const std::exception& e) {
                         record_check(false, __FILE__, __LINE__,
                                     "uncaught exception in case discovery", e.what(),
-                                    true, cfg.quiet);
+                                    false, cfg.quiet);
                     } catch (...) {
                         record_check(false, __FILE__, __LINE__,
                                     "uncaught non-std exception in case discovery", "",
-                                    true, cfg.quiet);
+                                    false, cfg.quiet);
                     }
                     route().mode = SubcaseMode::Normal;
                     route().current_case = nullptr;
@@ -1378,11 +1395,11 @@ inline int run(int argc, char** argv) {
                                 } catch (const std::exception& e) {
                                     ::chtest::record_check(false, __FILE__, __LINE__,
                                                               "uncaught exception in subcase",
-                                                              e.what(), true, ::chtest::current_quiet());
+                                                              e.what(), false, ::chtest::current_quiet());
                                 } catch (...) {
                                     ::chtest::record_check(false, __FILE__, __LINE__,
                                                               "uncaught non-std exception in subcase",
-                                                              "", true, ::chtest::current_quiet());
+                                                              "", false, ::chtest::current_quiet());
                                 }
                             }, sub_abort);
 
@@ -1401,11 +1418,11 @@ inline int run(int argc, char** argv) {
                                 } catch (const std::exception& e) {
                                     ::chtest::record_check(false, __FILE__, __LINE__,
                                                               "uncaught exception in subcase",
-                                                              e.what(), true, cfg.quiet);
+                                                              e.what(), false, cfg.quiet);
                                 } catch (...) {
                                     ::chtest::record_check(false, __FILE__, __LINE__,
                                                               "uncaught non-std exception in subcase",
-                                                              "", true, cfg.quiet);
+                                                              "", false, cfg.quiet);
                                 }
                             }
                         } else {
@@ -1413,11 +1430,11 @@ inline int run(int argc, char** argv) {
                                 T.fn();
                             } catch (const std::exception& e) {
                                 record_check(false, __FILE__, __LINE__,
-                                            "uncaught exception in subcase", e.what(), true,
+                                            "uncaught exception in subcase", e.what(), false,
                                             cfg.quiet);
                             } catch (...) {
                                 record_check(false, __FILE__, __LINE__,
-                                            "uncaught non-std exception in subcase", "", true,
+                                            "uncaught non-std exception in subcase", "", false,
                                             cfg.quiet);
                             }
                         }
