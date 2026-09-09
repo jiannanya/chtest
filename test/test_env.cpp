@@ -1,6 +1,6 @@
 #include "test_env.hpp"
 
-int GlobalState::counter = 0;
+thread_local int GlobalState::counter = 0;
 
 void ResetEnv::setUp() {
     GlobalState::counter = 0;

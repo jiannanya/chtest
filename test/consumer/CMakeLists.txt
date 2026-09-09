@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(chtest_consumer LANGUAGES CXX)
+find_package(chtest CONFIG REQUIRED)
+add_executable(consumer main.cpp other.cpp)
+target_link_libraries(consumer PRIVATE chtest::chtest)
+enable_testing()
+add_test(NAME installed_consumer COMMAND consumer --quiet --no-color)
+set_tests_properties(installed_consumer PROPERTIES PASS_REGULAR_EXPRESSION "cases=2 subcases=0 checks=2 failures=0")

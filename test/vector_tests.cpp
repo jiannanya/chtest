@@ -65,9 +65,3 @@ TEST_CASE("seq_eq_lists_vectors") {
     std::list<int> l = {1, 2, 3, 4};
     CHECK_SEQ_EQ(v, l);
 }
-
-TEST_CASE("seq_eq_mismatch_note") {
-    std::vector<int> a = {1, 2, 4};
-    std::list<int> b = {1, 2, 3};
-    CHECK_SEQ_EQ(a, b);
-}

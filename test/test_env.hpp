@@ -3,7 +3,7 @@
 #include "chtest.hpp"
 
 struct GlobalState {
-    static int counter;
+    static thread_local int counter;
 };
 
 struct ResetEnv : chtest::Environment {
