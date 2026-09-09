@@ -17,135 +17,184 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
-#include <future>
+#include <cstdint>
+#include <charconv>
+#include <condition_variable>
+#include <cctype>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <tuple>
+#include <unordered_map>
 #include <cmath>
 #include <iterator>
 #include <string_view>
 
 namespace chtest {
-// Per-case buffer holding an ostringstream and a mutex. Each running case
-// owns one of these (stack-allocated in `case_output_collector`) and
-// child threads may append to it while it exists. The mutex serializes
-// appends to the buffer; this avoids races when multiple threads write to
-// the same case buffer.
+
+using count_type = std::uint64_t;
+
+// Output is buffered in bounded chunks; context helpers keep buffers alive.
 struct PerCaseBuffer {
-    std::ostringstream buf;
+    std::string buf;
     std::mutex mtx;
+    std::size_t limit = 64 * 1024;
+    bool closed = false;
 };
-
-// Per-thread pointer to the current case's buffer (or nullptr). Threads do
-// not inherit TLS automatically; use the provided helpers to propagate the
-// pointer into spawned threads.
 inline thread_local PerCaseBuffer* tls_case_out = nullptr;
-// Keep a shared_ptr to the current case buffer so it can be propagated and
-// kept alive across threads when using the context helpers.
-inline thread_local std::shared_ptr<PerCaseBuffer> tls_case_out_keep = nullptr;
-// Keep a shared_ptr to the current case abort flag so it can be propagated
-// and kept alive across threads when using the context helpers.
-inline thread_local std::shared_ptr<std::atomic<bool>> tls_case_abort_keep = nullptr;
-// Per-thread pointer to a shared atomic used to signal a fatal failure inside
-// a case from any thread. The pointer value is provided by the case owner
-// (worker) and may point into a shared_ptr kept alive for the case lifetime.
+inline thread_local std::shared_ptr<PerCaseBuffer> tls_case_out_keep;
+inline thread_local std::shared_ptr<std::atomic<bool>> tls_case_abort_keep;
 inline thread_local std::atomic<bool>* tls_case_abort = nullptr;
-// Per-case failure counter keeper: child threads inherit a shared_ptr to
-// this atomic so failures recorded from any thread during a case attempt
-// can be counted specifically for that case.
-inline thread_local std::shared_ptr<std::atomic<int>> tls_case_fail_count_keep = nullptr;
-inline thread_local std::atomic<int>* tls_case_fail_count = nullptr;
-
-// Global flush mutex used when emitting a completed case buffer to stdout.
+inline thread_local std::shared_ptr<std::atomic<count_type>> tls_case_fail_count_keep;
+inline thread_local std::atomic<count_type>* tls_case_fail_count = nullptr;
+inline thread_local bool tls_in_output_sink = false;
 inline std::mutex& global_out_mutex() { static std::mutex m; return m; }
+inline std::atomic<bool>& output_failed() { static std::atomic<bool> failed{false}; return failed; }
 
-
-// Optional external output sink.
-// If set, all flushed strings will be forwarded to this sink.
-// Otherwise, output defaults to `std::cout`.
-//
-// Thread-safety: atomic shared_ptr so writers don't race with set/clear.
 using output_sink_t = std::function<void(std::string_view)>;
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
 inline std::atomic<std::shared_ptr<output_sink_t>>& output_sink() {
-    static std::atomic<std::shared_ptr<output_sink_t>> sink{nullptr};
+    static std::atomic<std::shared_ptr<output_sink_t>> sink;
     return sink;
 }
-
+inline std::shared_ptr<output_sink_t> load_output_sink() { return output_sink().load(std::memory_order_acquire); }
+#else
+inline std::shared_ptr<output_sink_t>& output_sink() {
+    static std::shared_ptr<output_sink_t> sink;
+    return sink;
+}
+inline std::shared_ptr<output_sink_t> load_output_sink() {
+    return std::atomic_load_explicit(&output_sink(), std::memory_order_acquire);
+}
+#endif
 inline void set_output_sink(output_sink_t sink) {
-    output_sink().store(std::make_shared<output_sink_t>(std::move(sink)), std::memory_order_release);
+    auto next = sink ? std::make_shared<output_sink_t>(std::move(sink)) : std::shared_ptr<output_sink_t>{};
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+    output_sink().store(std::move(next), std::memory_order_release);
+#else
+    std::atomic_store_explicit(&output_sink(), std::move(next), std::memory_order_release);
+#endif
 }
-
-inline void clear_output_sink() {
-    output_sink().store(nullptr, std::memory_order_release);
-}
-
-inline void emit_output(std::string_view s) {
+inline void clear_output_sink() { set_output_sink({}); }
+inline void emit_output(std::string_view s) noexcept {
     if (s.empty()) return;
-    auto sink = output_sink().load(std::memory_order_acquire);
-    if (sink) {
-        (*sink)(s);
+    // Recursive serialization permits a sink to log through ts_cout(). Nested
+    // output goes to stdout so a sink cannot recursively call itself forever.
+    static std::recursive_mutex mutex;
+    try {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        auto sink = load_output_sink();
+        if (sink && !tls_in_output_sink) {
+            struct Guard { bool& flag; Guard(bool& f) : flag(f) { flag = true; } ~Guard() { flag = false; } } guard(tls_in_output_sink);
+            (*sink)(s);
+        } else {
+            std::cout.write(s.data(), static_cast<std::streamsize>(s.size()));
+            if (!std::cout) output_failed().store(true, std::memory_order_relaxed);
+        }
+    } catch (...) { output_failed().store(true, std::memory_order_relaxed); }
+}
+inline void append_output(PerCaseBuffer* buffer, std::string_view text) {
+    if (!buffer || tls_in_output_sink) { emit_output(text); return; }
+    std::unique_lock<std::mutex> lock(buffer->mtx);
+    if (!buffer->closed && text.size() < buffer->limit &&
+        buffer->buf.size() <= buffer->limit - text.size()) {
+        buffer->buf.append(text.data(), text.size());
         return;
     }
-    std::cout << s;
+    std::string ready;
+    const bool direct = buffer->closed || text.size() >= buffer->limit;
+    ready.swap(buffer->buf);
+    if (!direct) buffer->buf.append(text.data(), text.size());
+    lock.unlock();
+    // Never invoke user callbacks while holding the buffer mutex.
+    if (!ready.empty()) emit_output(ready);
+    if (direct) emit_output(text);
 }
-
-// Thread-safe output proxy: accumulate into an ostringstream and flush
-// to std::cout while holding a mutex when the temporary is destroyed.
-struct ts_ostream_proxy {
-    std::ostringstream ss;
-    ts_ostream_proxy() = default;
-    template <typename T>
-    ts_ostream_proxy& operator<<(const T& v) {
-        ss << v;
-        return *this;
+class ts_ostream_proxy {
+    char small_text[256];
+    std::size_t small_size = 0;
+    std::string text;
+    std::optional<std::ostringstream> stream;
+    std::string_view text_view() const {
+        return text.empty() ? std::string_view(small_text, small_size) : std::string_view(text);
     }
-    // ensure manipulators like std::endl/std::flush work
-    ts_ostream_proxy& operator<<(std::ostream& (*manip)(std::ostream&)) {
-        ss << manip;
-        return *this;
-    }
-    ~ts_ostream_proxy() noexcept {
-        // If there's a per-case buffer installed, lock that buffer's mutex
-        // and append into it. Otherwise fall back to writing directly to
-        // stdout (protected by the global_out_mutex to preserve ordering).
-        if (tls_case_out) {
-            std::lock_guard<std::mutex> lk(tls_case_out->mtx);
-            tls_case_out->buf << ss.str();
+    void append_text(std::string_view value) {
+        if (value.empty()) return;
+        if (text.empty() && value.size() <= sizeof(small_text) - small_size) {
+            std::char_traits<char>::copy(small_text + small_size, value.data(), value.size());
+            small_size += value.size();
         } else {
-            std::lock_guard<std::mutex> lk(global_out_mutex());
-            emit_output(ss.str());
+            if (text.empty()) {
+                text.reserve(small_size + value.size());
+                text.append(small_text, small_size);
+                small_size = 0;
+            }
+            text.append(value.data(), value.size());
         }
     }
+    std::ostringstream& formatted() {
+        if (!stream) {
+            stream.emplace();
+            const auto prefix = text_view();
+            if (!prefix.empty()) stream->write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+            std::string().swap(text);
+            small_size = 0;
+        }
+        return *stream;
+    }
+public:
+    // Text-only messages need no locale, stream buffer, or final str() copy.
+    ts_ostream_proxy& operator<<(std::string_view value) {
+        if (stream) *stream << value;
+        else append_text(value);
+        return *this;
+    }
+    ts_ostream_proxy& operator<<(const std::string& value) { return *this << std::string_view(value); }
+    ts_ostream_proxy& operator<<(const char* value) {
+        if (!value) formatted() << value;
+        else *this << std::string_view(value);
+        return *this;
+    }
+    ts_ostream_proxy& operator<<(char value) {
+        if (stream) *stream << value;
+        else append_text(std::string_view(&value, 1));
+        return *this;
+    }
+    template <typename T> ts_ostream_proxy& operator<<(const T& value) { formatted() << value; return *this; }
+    ts_ostream_proxy& operator<<(std::ostream& (*manip)(std::ostream&)) { formatted() << manip; return *this; }
+    ~ts_ostream_proxy() noexcept {
+        try {
+            if (stream) append_output(tls_case_out, stream->str());
+            else append_output(tls_case_out, text_view());
+        }
+        catch (...) { output_failed().store(true, std::memory_order_relaxed); }
+    }
 };
-
 inline ts_ostream_proxy ts_cout() { return ts_ostream_proxy(); }
-
 struct case_output_collector {
     std::shared_ptr<PerCaseBuffer> buf;
-    case_output_collector() : buf(std::make_shared<PerCaseBuffer>()) {
+    PerCaseBuffer* previous;
+    std::shared_ptr<PerCaseBuffer> previous_keep;
+    explicit case_output_collector(std::size_t limit = 64 * 1024)
+        : case_output_collector(std::make_shared<PerCaseBuffer>(), limit) {}
+    case_output_collector(std::shared_ptr<PerCaseBuffer> buffer, std::size_t limit)
+        : buf(std::move(buffer)), previous(tls_case_out), previous_keep(tls_case_out_keep) {
+        buf->limit = limit;
         tls_case_out_keep = buf;
         tls_case_out = buf.get();
     }
     ~case_output_collector() noexcept {
-        // Lock the per-buffer mutex to synchronize with writers and
-        // capture the current contents. Then clear the TLS pointer and
-        // keeper so any subsequent writers will write directly to stdout.
-        // Finally, emit the captured string under the global_out_mutex to
-        // preserve ordering with other direct stdout writes.
-        std::string s;
-        {
-            std::lock_guard<std::mutex> lk(buf->mtx);
-            s = buf->buf.str();
-            tls_case_out = nullptr;
-            tls_case_out_keep.reset();
-        }
-        if (!s.empty()) {
-            std::lock_guard<std::mutex> lk(global_out_mutex());
-            emit_output(s);
-        }
+        tls_case_out = previous;
+        tls_case_out_keep = std::move(previous_keep);
+        try {
+            std::string text;
+            { std::lock_guard<std::mutex> lock(buf->mtx); buf->closed = true; text.swap(buf->buf); }
+            append_output(previous, text);
+        } catch (...) { output_failed().store(true, std::memory_order_relaxed); }
     }
-    // non-copyable
     case_output_collector(const case_output_collector&) = delete;
     case_output_collector& operator=(const case_output_collector&) = delete;
 };
-
 
 // ---------- Unique name helpers ----------
 #define CH_TEST_CONCAT_INNER(a,b) a##b
@@ -155,6 +204,11 @@ struct case_output_collector {
 // ---------- Config ----------
 struct Config {
     std::string pattern;
+    bool help = false;
+    bool timings = false;
+    std::size_t buffer_limit = 64 * 1024;
+    std::vector<std::string> any_tags, all_tags, excluded_tags;
+    bool untagged_only = false;
     bool list_all = false;      // --list
     bool list_cases = false;    // --cases
     int repeat = 1;             // --repeat N
@@ -196,6 +250,7 @@ struct Color {
 
 // ---------- Environment ----------
 struct Environment {
+    virtual ~Environment() = default;
     virtual void setUp() {}
     virtual void tearDown() {}
 };
@@ -205,8 +260,17 @@ inline Environment*& global_env() { static Environment* env=nullptr; return env;
 
 
 // ---------- Test case & registry ----------
+struct SubcaseId {
+    std::string name;
+    const char* file = "";
+    int line = 0;
+    bool operator==(const SubcaseId& other) const {
+        return line == other.line && name == other.name && std::string_view(file) == other.file;
+    }
+};
 struct Subcase {
     std::string name;
+    std::vector<SubcaseId> path;
 };
 
 struct TestCase {
@@ -239,9 +303,7 @@ struct TestRegistrar {
 };
 
 // Convenience registration macros that accept priority/retries/skip predicate
-#define TEST_CASE_PRIO(NAME, PRIO) \
-TEST_CASE_IMPL(NAME, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQUE_NAME(CH_TEST_REG)) \
-/* the above macro expands into a registrar; override below by reassigning priority */
+#define TEST_CASE_PRIO(NAME, PRIO) TEST_CASE_PRIORITY(NAME, PRIO)
 
 // Helper macros to register with explicit priority or retries or skip predicate
 #define TEST_CASE_WITH_OPTS_IMPL(NAME, PRIO, RETRIES, SKIP_PRED, CH_TEST_FN, CH_TEST_REG) \
@@ -285,111 +347,154 @@ TEST_CASE_SKIP_IF_IMPL(NAME, PRED, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQ
 
 // ---------- Global subcase routing state ----------
 enum class SubcaseMode { Normal, Discovery, Active };
+using SubcaseIndex = std::unordered_multimap<std::size_t, std::size_t>;
 
 struct RouteState {
     SubcaseMode mode = SubcaseMode::Normal;
-    const char* active_name = nullptr;   // subcase currently executing
-    TestCase* current_case = nullptr;    // case under discovery/execution
+    const char* active_name = nullptr;
+    TestCase* current_case = nullptr;
     bool in_subcase = false;
+    const std::vector<SubcaseId>* active_path = nullptr;
+    std::vector<SubcaseId> path;
+    SubcaseIndex* discovery_index = nullptr;
+    std::size_t entered_depth = 0;
 };
-
-inline RouteState& route() {
-    static thread_local RouteState R;
-    return R;
+inline RouteState& route() { static thread_local RouteState state; return state; }
+inline bool assertions_enabled() {
+    const auto& rt = route();
+    return rt.mode == SubcaseMode::Discovery ||
+        (rt.mode == SubcaseMode::Active && rt.in_subcase &&
+         (!rt.active_path || rt.path.size() == rt.active_path->size()));
 }
-
-struct ScopedSubcaseFlag {
-    bool active=true;
-    ScopedSubcaseFlag(){ route().in_subcase=true; }
-    ~ScopedSubcaseFlag(){ route().in_subcase=false; }
-};
-
-// Called inside SUBCASE macro to decide execution & register
-inline bool subcase_enter(const char* name) {
+inline std::size_t subcase_hash_append(std::size_t hash, std::string_view name, std::string_view file, int line) {
+    const auto combine = [&](std::size_t value) { hash ^= value + std::size_t{0x9e3779b9} + (hash << 6) + (hash >> 2); };
+    combine(std::hash<std::string_view>{}(name));
+    combine(std::hash<std::string_view>{}(file));
+    combine(static_cast<std::size_t>(line));
+    return hash;
+}
+inline std::size_t subcase_path_hash(const std::vector<SubcaseId>& path) {
+    std::size_t hash = 0;
+    for (const auto& id : path) hash = subcase_hash_append(hash, id.name, id.file, id.line);
+    return hash;
+}
+inline bool subcase_enter(const char* name, const char* file = "", int line = 0) {
     auto& rt = route();
-    if (rt.mode == SubcaseMode::Active) {
-        return (rt.active_name && std::string(rt.active_name) == name);
+    const auto matches = [&](const SubcaseId& id) {
+        return id.line == line && std::string_view(id.name) == name &&
+               (id.file == file || std::string_view(id.file) == file);
+    };
+    if (rt.mode == SubcaseMode::Active && rt.active_path && rt.path.size() < rt.active_path->size()) {
+        if (rt.entered_depth > rt.path.size() || !matches((*rt.active_path)[rt.path.size()])) return false;
+        rt.entered_depth = rt.path.size() + 1;
+        return true;
     }
-    if (rt.mode == SubcaseMode::Discovery) {
-        if (rt.current_case) {
-            rt.current_case->subcases.push_back(Subcase{ name });
-        }
-        return false; // do not execute subcase body during discovery/base
+    if (rt.current_case && (rt.mode == SubcaseMode::Discovery ||
+                           (rt.mode == SubcaseMode::Active && rt.in_subcase))) {
+        auto& subcases = rt.current_case->subcases;
+        const auto same_path = [&](const Subcase& sc) {
+            return sc.path.size() == rt.path.size() + 1 && matches(sc.path.back()) &&
+                   std::equal(rt.path.begin(), rt.path.end(), sc.path.begin());
+        };
+        // Small cases keep the allocation-free linear path. Large discoveries
+        // use an index of vector positions, with full equality on hash collisions.
+        auto* index = rt.discovery_index;
+        const bool indexed = index && subcases.size() >= 32;
+        std::size_t hash = 0;
+        if (indexed) {
+            if (index->empty()) {
+                index->reserve(subcases.size() * 2);
+                for (std::size_t i = 0; i < subcases.size(); ++i)
+                    index->emplace(subcase_path_hash(subcases[i].path), i);
+            }
+            hash = subcase_hash_append(subcase_path_hash(rt.path), name, file, line);
+            const auto range = index->equal_range(hash);
+            for (auto found = range.first; found != range.second; ++found)
+                if (same_path(subcases[found->second])) return false;
+        } else if (std::any_of(subcases.begin(), subcases.end(), same_path)) return false;
+        auto path = rt.path;
+        path.push_back({name, file, line});
+        subcases.push_back({name, std::move(path)});
+        if (indexed) index->emplace(hash, subcases.size() - 1);
     }
-    // Normal base run: skip subcase bodies
-    return false;
+    return rt.mode == SubcaseMode::Active && !rt.active_path && rt.active_name &&
+           std::string_view(rt.active_name) == name;
 }
-
-// Helper functions to allow child threads to observe the current test/subcase
-// context. Must be defined after RouteState/route() so route() is visible.
-template <typename F>
-inline std::function<void()> with_current_case_context(F f, std::shared_ptr<std::atomic<bool>> abort_keep = nullptr) {
-    // capture current thread-local route, case output pointer and keepers
-    auto route_snapshot = route();
-    PerCaseBuffer* outptr = tls_case_out;
-    auto out_keep = tls_case_out_keep;
-    auto abort_keep_local = abort_keep ? abort_keep : tls_case_abort_keep;
-    std::atomic<bool>* abort_ptr = abort_keep_local ? abort_keep_local.get() : nullptr;
-
-    return [route_snapshot, outptr, out_keep = std::move(out_keep), abort_keep_local = std::move(abort_keep_local), abort_ptr, f = std::move(f)]() mutable {
-        // save current thread's values so we can restore them
-        auto prev_route = route();
-        PerCaseBuffer* prev_out = tls_case_out;
-        auto prev_out_keep = tls_case_out_keep;
-        std::atomic<bool>* prev_abort = tls_case_abort;
-        auto prev_abort_keep = tls_case_abort_keep;
-
-        // install the captured context
-        route() = route_snapshot;
-        tls_case_out = outptr;
-        tls_case_out_keep = out_keep;
-        tls_case_abort = abort_ptr;
-        tls_case_abort_keep = abort_keep_local;
-
-        try {
-            f();
-        } catch(...) {
-            // restore before rethrowing
-            route() = prev_route;
-            tls_case_out = prev_out;
-            tls_case_out_keep = prev_out_keep;
-            tls_case_abort = prev_abort;
-            tls_case_abort_keep = prev_abort_keep;
-            throw;
+struct ScopedSubcaseFlag {
+    bool active = true;
+    bool previous = route().in_subcase;
+    bool pushed = false;
+    ScopedSubcaseFlag() { route().in_subcase = true; }
+    ScopedSubcaseFlag(const char* name, const char* file, int line) : active(subcase_enter(name, file, line)) {
+        if (active) {
+            route().path.push_back({name, file, line});
+            route().in_subcase = true;
+            pushed = true;
         }
+    }
+    ~ScopedSubcaseFlag() {
+        if (pushed) route().path.pop_back();
+        route().in_subcase = previous;
+    }
+};
+struct AssertionFailure : std::exception {
+    const char* what() const noexcept override { return "REQUIRE failed"; }
+};
+template <typename F> bool invoke_guarded(F&& fn, const char* description);
 
-        // restore previous context
-        route() = prev_route;
-        tls_case_out = prev_out;
-        tls_case_out_keep = prev_out_keep;
-        tls_case_abort = prev_abort;
-        tls_case_abort_keep = prev_abort_keep;
+// A full RAII snapshot also restores the per-case failure counter on exceptions.
+struct CaseContext {
+    RouteState routing = route();
+    PerCaseBuffer* out = tls_case_out;
+    std::shared_ptr<PerCaseBuffer> out_keep = tls_case_out_keep;
+    std::atomic<bool>* abort = tls_case_abort;
+    std::shared_ptr<std::atomic<bool>> abort_keep = tls_case_abort_keep;
+    std::atomic<count_type>* failures = tls_case_fail_count;
+    std::shared_ptr<std::atomic<count_type>> failures_keep = tls_case_fail_count_keep;
+    void install() const {
+        route() = routing;
+        tls_case_out = out; tls_case_out_keep = out_keep;
+        tls_case_abort = abort; tls_case_abort_keep = abort_keep;
+        tls_case_fail_count = failures; tls_case_fail_count_keep = failures_keep;
+    }
+    void restore() noexcept {
+        route() = std::move(routing);
+        tls_case_out = out; tls_case_out_keep = std::move(out_keep);
+        tls_case_abort = abort; tls_case_abort_keep = std::move(abort_keep);
+        tls_case_fail_count = failures; tls_case_fail_count_keep = std::move(failures_keep);
+    }
+};
+struct ContextRestore {
+    CaseContext previous;
+    ~ContextRestore() { previous.restore(); }
+};
+template <typename F>
+inline auto with_current_case_context(F&& f, std::shared_ptr<std::atomic<bool>> abort_keep = nullptr) {
+    CaseContext context;
+    // Subcases may only be registered by the case runner, never by a child.
+    context.routing.current_case = nullptr;
+    context.routing.discovery_index = nullptr;
+    if (abort_keep) { context.abort_keep = std::move(abort_keep); context.abort = context.abort_keep.get(); }
+    return [context = std::move(context), fn = std::forward<F>(f)]() mutable -> decltype(auto) {
+        ContextRestore guard;
+        context.install();
+        return std::invoke(fn);
     };
 }
-
-// Create a shared abort flag for a case. Keep the returned shared_ptr alive
-// for the duration of the case (or until all spawned threads finish). Use
-// this together with `with_current_case_context(..., abort_ptr)` or
-// `spawn_with_context` so child threads see the flag.
 inline std::shared_ptr<std::atomic<bool>> make_case_abort() {
     return std::make_shared<std::atomic<bool>>(false);
 }
-
-// Spawn a std::thread that inherits the current test/subcase context (route,
-// tls_case_out) and optionally a shared abort flag. Returns a std::thread
-// object the caller must join.
 template <typename Fn, typename... Args>
 inline std::thread spawn_with_context(std::shared_ptr<std::atomic<bool>> abort_keep, Fn&& fn, Args&&... args) {
-    auto bound = std::bind(std::forward<Fn>(fn), std::forward<Args>(args)...);
-    auto wrapped = with_current_case_context([bound]() mutable { bound(); }, std::move(abort_keep));
-    return std::thread(std::move(wrapped));
+    auto task = [fn = std::forward<Fn>(fn), args = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+        invoke_guarded([&] { std::apply(std::move(fn), std::move(args)); }, "uncaught exception in child thread");
+    };
+    return std::thread(with_current_case_context(std::move(task), std::move(abort_keep)));
 }
-
-template <typename Fn, typename... Args>
+template <typename Fn, typename... Args,
+          std::enable_if_t<!std::is_same_v<std::decay_t<Fn>, std::shared_ptr<std::atomic<bool>>>, int> = 0>
 inline std::thread spawn_with_context(Fn&& fn, Args&&... args) {
-    auto bound = std::bind(std::forward<Fn>(fn), std::forward<Args>(args)...);
-    auto wrapped = with_current_case_context([bound]() mutable { bound(); });
-    return std::thread(std::move(wrapped));
+    return spawn_with_context(std::shared_ptr<std::atomic<bool>>{}, std::forward<Fn>(fn), std::forward<Args>(args)...);
 }
 
 // ---------- Pretty printing helpers ----------
@@ -397,7 +502,7 @@ template <typename T>
 struct is_streamable {
 private:
     template <typename U>
-    static auto test(int) -> decltype(std::declval<std::ostream&>() << std::declval<U>(), std::true_type{});
+    static auto test(int) -> decltype(std::declval<std::ostream&>() << std::declval<const U&>(), std::true_type{});
     template <typename>
     static auto test(...) -> std::false_type;
 public:
@@ -407,9 +512,13 @@ public:
 template <typename T>
 std::string to_string_any(const T& v) {
     if constexpr (is_streamable<T>::value) {
-        std::ostringstream oss;
-        oss << v;
-        return oss.str();
+        try {
+            std::ostringstream oss;
+            oss << v;
+            return oss ? oss.str() : "<formatting failed>";
+        } catch (const AssertionFailure&) { throw; }
+        catch (const std::exception&) { return "<formatting threw>"; }
+        catch (...) { return "<formatting threw>"; }
     } else {
         return "<value>";
     }
@@ -470,20 +579,24 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         return data_;
     }
+    [[deprecated("Use to_vector() or for_each(); iterators require external synchronization")]]
     iterator begin() {
         std::lock_guard<std::mutex> lock(mtx_);
         return data_.begin();
     }
 
+    [[deprecated("Use to_vector() or for_each(); iterators require external synchronization")]]
     iterator end() {
         std::lock_guard<std::mutex> lock(mtx_);
         return data_.end();
     }
 
+    [[deprecated("Use to_vector() or for_each(); iterators require external synchronization")]]
     const_iterator begin() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return data_.begin();
     }
+    [[deprecated("Use to_vector() or for_each(); iterators require external synchronization")]]
     const_iterator end() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return data_.end();
@@ -557,9 +670,10 @@ public:
         return true;
     }
 
-    void clear() {
+    void clear(bool release_memory = false) {
         std::lock_guard<std::mutex> lock(mtx_);
         data_.clear();
+        if (release_memory) std::vector<T>().swap(data_);
     }
 
     // 5. 容量操作
@@ -624,13 +738,16 @@ private:
 };
 
 struct Aggregates {
-    std::atomic<int> cases = 0;
-    std::atomic<int> subcases = 0;
-    std::atomic<int> checks = 0;
-    std::atomic<int> failures = 0;
-    std::atomic<int> timeouts = 0; // number of subcase or case timeouts observed
-    std::atomic<int> retries = 0;  // number of retry attempts performed
-    std::atomic<int> slow_cases = 0; // number of cases detected as slow
+    std::atomic<count_type> cases = 0;
+    std::atomic<count_type> skipped = 0;
+    std::atomic<count_type> failed_cases = 0;
+    std::atomic<count_type> retried_failures = 0;
+    std::atomic<count_type> subcases = 0;
+    std::atomic<count_type> checks = 0;
+    std::atomic<count_type> failures = 0;
+    std::atomic<count_type> timeouts = 0; // number of subcase or case timeouts observed
+    std::atomic<count_type> retries = 0;  // number of retry attempts performed
+    std::atomic<count_type> slow_cases = 0; // number of cases detected as slow
     ThreadSafeVector<std::pair<std::string,double>> slow_case_info; // name + duration ms
     ThreadSafeVector<std::pair<std::string, double>> case_times;
     ThreadSafeVector<std::pair<std::string, double>> subcase_times;
@@ -644,71 +761,92 @@ inline Aggregates& agg() { static Aggregates A; return A; }
 template<typename Signature>
 class MockFunction;
 
+
 template<typename Ret, typename... Args>
 class MockFunction<Ret(Args...)> {
-    std::function<Ret(Args...)> impl;
+    struct Implementation {
+        std::function<Ret(Args...)> fn;
+        std::recursive_mutex mutex;
+        explicit Implementation(std::function<Ret(Args...)> f) : fn(std::move(f)) {}
+    };
+    std::shared_ptr<Implementation> impl;
     mutable std::mutex mtx;
-    int call_count = 0;
-    std::vector<std::tuple<Args...>> calls;
-
+    std::size_t call_count = 0;
+    using Call = std::tuple<std::decay_t<Args>...>;
+    static constexpr bool can_record = (std::is_copy_constructible_v<std::decay_t<Args>> && ...);
+    bool record_calls = can_record;
+    std::size_t history_limit = std::numeric_limits<std::size_t>::max();
+    std::vector<Call> calls;
 public:
     MockFunction() = default;
-    MockFunction(std::function<Ret(Args...)> f) : impl(std::move(f)) {}
-
-    // 设置实现
+    explicit MockFunction(std::function<Ret(Args...)> f) { setImpl(std::move(f)); }
     void setImpl(std::function<Ret(Args...)> f) {
+        auto next = f ? std::make_shared<Implementation>(std::move(f)) : nullptr;
         std::lock_guard<std::mutex> lock(mtx);
-        impl = std::move(f);
+        impl.swap(next);
     }
-
-    // 调用
     Ret operator()(Args... args) {
+        std::shared_ptr<Implementation> current;
         {
             std::lock_guard<std::mutex> lock(mtx);
-            call_count++;
-            calls.emplace_back(args...);
+            if constexpr (can_record) {
+                if (record_calls && calls.size() < history_limit) calls.emplace_back(args...);
+            }
+            ++call_count;
+            current = impl;
         }
-        if (impl) return impl(args...);
-        if constexpr (!std::is_void_v<Ret>) return Ret{};
+        if (current) {
+            std::lock_guard<std::recursive_mutex> lock(current->mutex);
+            return current->fn(std::forward<Args>(args)...);
+        }
+        if constexpr (!std::is_void_v<Ret>) {
+            if constexpr (std::is_default_constructible_v<Ret>) return Ret{};
+            else throw std::bad_function_call();
+        }
     }
-
-    // 查询调用次数
-    int timesCalled() const {
+    std::size_t timesCalled() const { std::lock_guard<std::mutex> lock(mtx); return call_count; }
+    std::vector<Call> getCalls() const { std::lock_guard<std::mutex> lock(mtx); return calls; }
+    template <typename... Values> bool calledWith(const Values&... values) const {
+        const auto expected = std::tie(values...);
         std::lock_guard<std::mutex> lock(mtx);
-        return call_count;
+        return std::any_of(calls.begin(), calls.end(), [&](const Call& call) { return call == expected; });
     }
-
-    // 获取调用参数
-    std::vector<std::tuple<Args...>> getCalls() const {
+    void reserveCalls(std::size_t count) {
         std::lock_guard<std::mutex> lock(mtx);
-        return calls;
+        if (record_calls) calls.reserve(std::min(count, history_limit));
     }
-
-    // 清理记录
-    void reset() {
+    void setHistoryLimit(std::size_t count) {
+        std::lock_guard<std::mutex> lock(mtx);
+        history_limit = count;
+        if (calls.size() > count) calls.erase(calls.begin() + count, calls.end());
+        if (calls.capacity() > count) calls.shrink_to_fit();
+    }
+    void setRecordCalls(bool enabled) {
+        if (enabled && !can_record) throw std::logic_error("Mock arguments are not copyable");
+        std::lock_guard<std::mutex> lock(mtx);
+        record_calls = enabled;
+        if (!enabled) std::vector<Call>().swap(calls);
+    }
+    void reset(bool release_memory = false) {
         std::lock_guard<std::mutex> lock(mtx);
         call_count = 0;
         calls.clear();
+        if (release_memory) std::vector<Call>().swap(calls);
     }
 };
-
-// ---------- 辅助断言宏 ----------
 #define CHECK_CALLED(M) CHECK((M).timesCalled() > 0)
-#define CHECK_CALLED_TIMES(M,N) CHECK((M).timesCalled() == (N))
-#define CHECK_CALLED_WITH(M, ...) \
-    CHECK((M).getCalls().size() > 0 && (M).getCalls().back() == std::make_tuple(__VA_ARGS__))
-
-
+#define CHECK_CALLED_TIMES(M,N) CHECK_EQ((M).timesCalled(), (N))
+#define CHECK_CALLED_WITH(M, ...) CHECK((M).calledWith(__VA_ARGS__))
 
 // ---------- Assertion recording ----------
-inline void record_check(bool ok, const char* file, int line, const std::string& expr, const std::string& note, bool fatal, bool quiet) {
-    agg().checks++;
+inline void record_check(bool ok, const char* file, int line, std::string_view expr, std::string_view note, bool fatal, bool quiet) {
+    agg().checks.fetch_add(1, std::memory_order_relaxed);
     if (!ok) {
         // If a per-case fail counter is installed in TLS, increment it.
         if (::chtest::tls_case_fail_count) {
             ::chtest::tls_case_fail_count->fetch_add(1, std::memory_order_relaxed);
         }
-        agg().failures++;
+        agg().failures.fetch_add(1, std::memory_order_relaxed);
         // atomic colored "FAIL" line
         ts_cout() << (Color::instance().enabled ? Color::instance().red_code() : "")
                  << "    FAIL: " << (Color::instance().enabled ? Color::instance().reset_code() : "")
@@ -722,7 +860,7 @@ inline void record_check(bool ok, const char* file, int line, const std::string&
                      << "          note: " << (Color::instance().enabled ? Color::instance().reset_code() : "")
                      << note << "\n";
         }
-        if (fatal) throw std::runtime_error("REQUIRE failed");
+        if (fatal) throw AssertionFailure{};
     } else {
         if (!quiet) {
             ts_cout() << (Color::instance().enabled ? Color::instance().green_code() : "")
@@ -732,279 +870,203 @@ inline void record_check(bool ok, const char* file, int line, const std::string&
     }
 }
 
-// boolean
-#define CHECK(EXPR) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-        ::chtest::record_check((EXPR), __FILE__, __LINE__, #EXPR, "", false, ::chtest::current_quiet())
 
-#define REQUIRE(EXPR) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-        ::chtest::record_check((EXPR), __FILE__, __LINE__, #EXPR, "", true, ::chtest::current_quiet())
+inline bool& current_quiet() { static bool quiet = false; return quiet; }
+template <typename F> bool invoke_guarded(F&& fn, const char* description) {
+    try { std::forward<F>(fn)(); return true; }
+    catch (const AssertionFailure&) { return false; }
+    catch (const std::exception& e) { record_check(false, __FILE__, __LINE__, description, e.what(), false, current_quiet()); }
+    catch (...) { record_check(false, __FILE__, __LINE__, description, "non-std exception", false, current_quiet()); }
+    return false;
+}
+enum class FailureMode { Check, Require, ThreadRequire };
+template <typename Describe>
+inline void record_assertion(bool ok, const char* file, int line, const char* expression,
+                             FailureMode mode, Describe&& describe, std::string_view note = {}) {
+    const bool thread_abort = mode == FailureMode::ThreadRequire && tls_case_abort;
+    if (!ok && thread_abort) tls_case_abort->store(true, std::memory_order_relaxed);
+    const bool fatal = mode != FailureMode::Check && !thread_abort;
+    if (ok && current_quiet()) record_check(true, file, line, {}, {}, false, true);
+    else if (ok) record_check(true, file, line, expression, {}, false, false);
+    else record_check(false, file, line, expression, note.empty() ? std::forward<Describe>(describe)() : std::string(note), fatal, current_quiet());
+}
+template <typename A, typename B> std::string binary_note(const A& a, const B& b) {
+    return "lhs=" + to_string_any(a) + " rhs=" + to_string_any(b);
+}
+template <typename A, typename B, typename Compare>
+inline bool compare_values(const A& a, const B& b, Compare compare) {
+    if constexpr (std::is_integral_v<A> && std::is_integral_v<B>) {
+        if constexpr (std::is_signed_v<A> && std::is_signed_v<B>) {
+            return compare(static_cast<std::intmax_t>(a), static_cast<std::intmax_t>(b));
+        } else {
+            if constexpr (std::is_signed_v<A>) {
+                if (a < 0) return compare(-1, 0);
+            } else if constexpr (std::is_signed_v<B>) {
+                if (b < 0) return compare(0, -1);
+            }
+            return compare(static_cast<std::uintmax_t>(a), static_cast<std::uintmax_t>(b));
+        }
+    } else return compare(a, b);
+}
+#define CH_TEST_BOOL(MODE, EXPR) do { if (::chtest::assertions_enabled()) { \
+    const bool ch_test_ok = static_cast<bool>(EXPR); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, #EXPR, ::chtest::FailureMode::MODE, [] { return std::string{}; }); \
+} } while (false)
+#define CHECK(EXPR) CH_TEST_BOOL(Check, EXPR)
+#define REQUIRE(EXPR) CH_TEST_BOOL(Require, EXPR)
+#define THREAD_REQUIRE(EXPR) CH_TEST_BOOL(ThreadRequire, EXPR)
+#define CH_TEST_BINARY_MODE(MODE, OP, L, R) do { if (::chtest::assertions_enabled()) { \
+    [&](const auto& ch_test_l, const auto& ch_test_r) { \
+    const bool ch_test_ok = ::chtest::compare_values(ch_test_l, ch_test_r, [](const auto& ch_test_a, const auto& ch_test_b) { return ch_test_a OP ch_test_b; }); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, #L " " #OP " " #R, ::chtest::FailureMode::MODE, \
+        [&] { return ::chtest::binary_note(ch_test_l, ch_test_r); }); \
+    }((L), (R)); \
+} } while (false)
+#define CHECK_EQ(L,R) CH_TEST_BINARY_MODE(Check, ==, L, R)
+#define CHECK_NE(L,R) CH_TEST_BINARY_MODE(Check, !=, L, R)
+#define CHECK_LT(L,R) CH_TEST_BINARY_MODE(Check, <, L, R)
+#define CHECK_LE(L,R) CH_TEST_BINARY_MODE(Check, <=, L, R)
+#define CHECK_GT(L,R) CH_TEST_BINARY_MODE(Check, >, L, R)
+#define CHECK_GE(L,R) CH_TEST_BINARY_MODE(Check, >=, L, R)
+#define REQUIRE_EQ(L,R) CH_TEST_BINARY_MODE(Require, ==, L, R)
+#define REQUIRE_NE(L,R) CH_TEST_BINARY_MODE(Require, !=, L, R)
+#define REQUIRE_LT(L,R) CH_TEST_BINARY_MODE(Require, <, L, R)
+#define REQUIRE_LE(L,R) CH_TEST_BINARY_MODE(Require, <=, L, R)
+#define REQUIRE_GT(L,R) CH_TEST_BINARY_MODE(Require, >, L, R)
+#define REQUIRE_GE(L,R) CH_TEST_BINARY_MODE(Require, >=, L, R)
+#define THREAD_REQUIRE_EQ(L,R) CH_TEST_BINARY_MODE(ThreadRequire, ==, L, R)
+#define THREAD_REQUIRE_NE(L,R) CH_TEST_BINARY_MODE(ThreadRequire, !=, L, R)
+#define THREAD_REQUIRE_LT(L,R) CH_TEST_BINARY_MODE(ThreadRequire, <, L, R)
+#define THREAD_REQUIRE_LE(L,R) CH_TEST_BINARY_MODE(ThreadRequire, <=, L, R)
+#define THREAD_REQUIRE_GT(L,R) CH_TEST_BINARY_MODE(ThreadRequire, >, L, R)
+#define THREAD_REQUIRE_GE(L,R) CH_TEST_BINARY_MODE(ThreadRequire, >=, L, R)
 
-// THREAD_REQUIRE: thread-safe variant of REQUIRE. If a per-case abort flag
-// (`tls_case_abort`) is installed in the thread, THREAD_REQUIRE will record
-// the check and, on failure, set the abort flag instead of throwing. If no
-// abort flag is installed (i.e. running in the main test thread), it behaves
-// exactly like REQUIRE (throws on failure).
-#define THREAD_REQUIRE(EXPR) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    bool ok__ = (EXPR); \
-    if (::chtest::tls_case_abort) { \
-        ::chtest::record_check(ok__, __FILE__, __LINE__, #EXPR, "", false, ::chtest::current_quiet()); \
-        if (!ok__) *::chtest::tls_case_abort = true; \
-    } else { \
-        ::chtest::record_check(ok__, __FILE__, __LINE__, #EXPR, "", true, ::chtest::current_quiet()); \
-    } \
-} while(0)
-
-
-// binary
-#define CH_TEST_BINARY(opname, op, fatal, L, R)\
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do {                                                      \
-    auto&& lhs__ = (L);                                     \
-    auto&& rhs__ = (R);                                     \
-    bool ok__ = (lhs__ op rhs__);                           \
-    std::ostringstream expr__;                              \
-    expr__ << #opname " (" #L " " #op " " #R ")  lhs="      \
-           << ::chtest::to_string_any(lhs__)             \
-           << " rhs=" << ::chtest::to_string_any(rhs__); \
-    ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_EQ(L,R) CH_TEST_BINARY(EQ,==,false,L,R)
-#define CHECK_NE(L,R) CH_TEST_BINARY(NE,!=,false,L,R)
-#define CHECK_LT(L,R) CH_TEST_BINARY(LT,< ,false,L,R)
-#define CHECK_LE(L,R) CH_TEST_BINARY(LE,<=,false,L,R)
-#define CHECK_GT(L,R) CH_TEST_BINARY(GT,> ,false,L,R)
-#define CHECK_GE(L,R) CH_TEST_BINARY(GE,>=,false,L,R)
-
-#define REQUIRE_EQ(L,R) CH_TEST_BINARY(EQ,==,true,L,R)
-#define REQUIRE_NE(L,R) CH_TEST_BINARY(NE,!=,true,L,R)
-#define REQUIRE_LT(L,R) CH_TEST_BINARY(LT,< ,true,L,R)
-#define REQUIRE_LE(L,R) CH_TEST_BINARY(LE,<=,true,L,R)
-#define REQUIRE_GT(L,R) CH_TEST_BINARY(GT,> ,true,L,R)
-#define REQUIRE_GE(L,R) CH_TEST_BINARY(GE,>=,true,L,R)
-
-// Thread-aware binary comparison: if a per-case abort flag exists, record
-// failure and set the flag; otherwise behave like REQUIRE_* (throw on fail).
-#define CH_TEST_THREAD_BINARY(opname, op, L, R) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do {                                                      \
-    auto&& lhs__ = (L);                                     \
-    auto&& rhs__ = (R);                                     \
-    bool ok__ = (lhs__ op rhs__);                           \
-    std::ostringstream expr__;                              \
-    expr__ << #opname " (" #L " " #op " " #R ")  lhs="      \
-           << ::chtest::to_string_any(lhs__)             \
-           << " rhs=" << ::chtest::to_string_any(rhs__); \
-    if (::chtest::tls_case_abort) { \
-        ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", false, ::chtest::current_quiet()); \
-        if (!ok__) *::chtest::tls_case_abort = true; \
-    } else { \
-        ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", true, ::chtest::current_quiet()); \
-    } \
-} while(0)
-
-#define THREAD_REQUIRE_EQ(L,R) CH_TEST_THREAD_BINARY(EQ,==,L,R)
-#define THREAD_REQUIRE_NE(L,R) CH_TEST_THREAD_BINARY(NE,!=,L,R)
-#define THREAD_REQUIRE_LT(L,R) CH_TEST_THREAD_BINARY(LT,< ,L,R)
-#define THREAD_REQUIRE_LE(L,R) CH_TEST_THREAD_BINARY(LE,<=,L,R)
-#define THREAD_REQUIRE_GT(L,R) CH_TEST_THREAD_BINARY(GT,> ,L,R)
-#define THREAD_REQUIRE_GE(L,R) CH_TEST_THREAD_BINARY(GE,>=,L,R)
-
-// ---------- Advanced assertions ----------
-// Floating-point approx/near comparisons (absolute tolerance)
-template <typename A, typename B>
-inline bool approx_near_abs(const A& a, const B& b, long double abs_tol) {
-    long double la = (long double)a;
-    long double lb = (long double)b;
-    if (std::isfinite(la) && std::isfinite(lb)) {
-        return std::fabsl(la - lb) <= abs_tol;
+inline bool absolute_difference_within(long double left, long double right, long double tolerance) {
+    if ((left < 0) != (right < 0)) {
+        const auto large = std::max(std::fabs(left), std::fabs(right));
+        const auto small = std::min(std::fabs(left), std::fabs(right));
+        // Avoid overflow and keep the result independent of operand order.
+        return large <= tolerance && small <= tolerance - large;
     }
-    return la == lb;
+    return std::fabs(left - right) <= tolerance;
 }
-
-#define CH_TEST_NEAR_IMPL(fatal, L, R, TOL) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    auto&& lhs__ = (L); \
-    auto&& rhs__ = (R); \
-    bool ok__ = ::chtest::approx_near_abs(lhs__, rhs__, (long double)(TOL)); \
-    std::ostringstream expr__; \
-    expr__ << "NEAR(" #L "," #R ", tol=" << (TOL) << ")  lhs=" \
-           << ::chtest::to_string_any(lhs__) << " rhs=" << ::chtest::to_string_any(rhs__); \
-    ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_NEAR(L,R,TOL) CH_TEST_NEAR_IMPL(false, L, R, TOL)
-#define REQUIRE_NEAR(L,R,TOL) CH_TEST_NEAR_IMPL(true, L, R, TOL)
-#define THREAD_REQUIRE_NEAR(L,R,TOL) \
-    if (::chtest::tls_case_abort) { \
-        CH_TEST_NEAR_IMPL(false, L, R, TOL); \
-        if (!::chtest::approx_near_abs((L),(R),(long double)(TOL))) *::chtest::tls_case_abort = true; \
-    } else CH_TEST_NEAR_IMPL(true, L, R, TOL)
-
-// Approx with relative + absolute tolerance: pass if |a-b| <= max(abs_tol, rel_tol * max(|a|,|b|))
 template <typename A, typename B>
-inline bool approx_compare_rel_abs(const A& a, const B& b, long double rel_tol, long double abs_tol) {
-    long double la = (long double)a;
-    long double lb = (long double)b;
-    if (std::isfinite(la) && std::isfinite(lb)) {
-        long double diff = std::fabsl(la - lb);
-        long double mag = std::fmaxl(std::fabsl(la), std::fabsl(lb));
-        long double threshold = std::fmaxl(abs_tol, rel_tol * mag);
-        return diff <= threshold;
+inline bool approx_near_abs(const A& a, const B& b, long double tolerance) {
+    if (!(tolerance >= 0) || !std::isfinite(tolerance)) return false;
+    const long double left = static_cast<long double>(a), right = static_cast<long double>(b);
+    if (left == right) return true;
+    return std::isfinite(left) && std::isfinite(right) && absolute_difference_within(left, right, tolerance);
+}
+template <typename A, typename B>
+inline bool approx_compare_rel_abs(const A& a, const B& b, long double relative, long double absolute) {
+    if (!(relative >= 0) || !(absolute >= 0) || !std::isfinite(relative) || !std::isfinite(absolute)) return false;
+    const long double left = static_cast<long double>(a), right = static_cast<long double>(b);
+    if (left == right) return true;
+    if (!std::isfinite(left) || !std::isfinite(right)) return false;
+    const long double left_magnitude = std::fabs(left), right_magnitude = std::fabs(right);
+    const long double magnitude = std::max(left_magnitude, right_magnitude);
+    if ((left < 0) != (right < 0)) {
+        // Never form an overflowing difference, even as an intermediate.
+        return absolute_difference_within(left, right, absolute) ||
+               left_magnitude / magnitude + right_magnitude / magnitude <= relative;
     }
-    return la == lb;
+    const long double difference = std::fabs(left - right);
+    return difference <= absolute || difference / magnitude <= relative;
 }
-
-#define CH_TEST_APPROX_IMPL(fatal, L, R, REL, ABS) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    auto&& lhs__ = (L); \
-    auto&& rhs__ = (R); \
-    bool ok__ = ::chtest::approx_compare_rel_abs(lhs__, rhs__, (long double)(REL), (long double)(ABS)); \
-    std::ostringstream expr__; \
-    expr__ << "APPROX(" #L "," #R ", rel=" << (REL) << ", abs=" << (ABS) << ")  lhs=" \
-           << ::chtest::to_string_any(lhs__) << " rhs=" << ::chtest::to_string_any(rhs__); \
-    ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_APPROX(L,R,REL,ABS) CH_TEST_APPROX_IMPL(false, L, R, REL, ABS)
-#define REQUIRE_APPROX(L,R,REL,ABS) CH_TEST_APPROX_IMPL(true, L, R, REL, ABS)
-#define THREAD_REQUIRE_APPROX(L,R,REL,ABS) \
-    if (::chtest::tls_case_abort) { \
-        CH_TEST_APPROX_IMPL(false, L, R, REL, ABS); \
-        if (!::chtest::approx_compare_rel_abs((L),(R),(long double)(REL),(long double)(ABS))) *::chtest::tls_case_abort = true; \
-    } else CH_TEST_APPROX_IMPL(true, L, R, REL, ABS)
-
-// Container helpers
-template <typename Container, typename Elem>
-inline bool contains_in(const Container& c, const Elem& e) {
-    return std::find(std::begin(c), std::end(c), e) != std::end(c);
+#define CH_TEST_NEAR_MODE(MODE, L, R, TOL) do { if (::chtest::assertions_enabled()) { \
+    [&](const auto& ch_test_l, const auto& ch_test_r, long double ch_test_tol) { \
+    const bool ch_test_ok = ::chtest::approx_near_abs(ch_test_l, ch_test_r, ch_test_tol); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, "NEAR(" #L ", " #R ")", ::chtest::FailureMode::MODE, \
+        [&] { return ::chtest::binary_note(ch_test_l, ch_test_r) + " tolerance=" + ::chtest::to_string_any(ch_test_tol); }); \
+    }((L), (R), (TOL)); \
+} } while (false)
+#define CHECK_NEAR(L,R,TOL) CH_TEST_NEAR_MODE(Check, L, R, TOL)
+#define REQUIRE_NEAR(L,R,TOL) CH_TEST_NEAR_MODE(Require, L, R, TOL)
+#define THREAD_REQUIRE_NEAR(L,R,TOL) CH_TEST_NEAR_MODE(ThreadRequire, L, R, TOL)
+#define CH_TEST_APPROX_MODE(MODE, L, R, REL, ABS) do { if (::chtest::assertions_enabled()) { \
+    [&](const auto& ch_test_l, const auto& ch_test_r, long double ch_test_rel, long double ch_test_abs) { \
+    const bool ch_test_ok = ::chtest::approx_compare_rel_abs(ch_test_l, ch_test_r, ch_test_rel, ch_test_abs); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, "APPROX(" #L ", " #R ")", ::chtest::FailureMode::MODE, \
+        [&] { return ::chtest::binary_note(ch_test_l, ch_test_r) + " relative=" + ::chtest::to_string_any(ch_test_rel) + " absolute=" + ::chtest::to_string_any(ch_test_abs); }); \
+    }((L), (R), (REL), (ABS)); \
+} } while (false)
+#define CHECK_APPROX(L,R,REL,ABS) CH_TEST_APPROX_MODE(Check, L, R, REL, ABS)
+#define REQUIRE_APPROX(L,R,REL,ABS) CH_TEST_APPROX_MODE(Require, L, R, REL, ABS)
+#define THREAD_REQUIRE_APPROX(L,R,REL,ABS) CH_TEST_APPROX_MODE(ThreadRequire, L, R, REL, ABS)
+template <typename C, typename E> inline bool contains_in(const C& c, const E& e) {
+    using Element = std::decay_t<decltype(*std::begin(c))>;
+    if constexpr (std::is_integral_v<Element> && std::is_integral_v<E> &&
+                  std::is_signed_v<Element> != std::is_signed_v<E>) {
+        return std::find_if(std::begin(c), std::end(c), [&](const auto& value) {
+            return compare_values(value, e, std::equal_to<>{});
+        }) != std::end(c);
+    } else return std::find(std::begin(c), std::end(c), e) != std::end(c);
 }
-
-// Sequence equality with nice mismatch note
-template <typename A, typename B>
-inline bool seq_equal_note(const A& a, const B& b, std::string& note) {
-    auto it1 = std::begin(a), end1 = std::end(a);
-    auto it2 = std::begin(b), end2 = std::end(b);
-    size_t idx = 0;
-    for (; it1 != end1 && it2 != end2; ++it1, ++it2, ++idx) {
-        if (!(*it1 == *it2)) {
-            note = "mismatch at index " + std::to_string(idx) + " lhs=" + ::chtest::to_string_any(*it1) + " rhs=" + ::chtest::to_string_any(*it2);
+template <typename C> auto container_size_impl(const C& c, int) -> decltype(std::size(c)) { return std::size(c); }
+template <typename C> auto container_size_impl(const C& c, long) { return std::distance(std::begin(c), std::end(c)); }
+template <typename C> auto container_size(const C& c) { return container_size_impl(c, 0); }
+template <typename A, typename B> inline bool seq_equal_note(const A& a, const B& b, std::string& note) {
+    note.clear();
+    auto left = std::begin(a), left_end = std::end(a);
+    auto right = std::begin(b), right_end = std::end(b);
+    std::size_t index = 0;
+    for (; left != left_end && right != right_end; ++left, ++right, ++index) {
+        if (!compare_values(*left, *right, std::equal_to<>{})) {
+            note = "mismatch at index " + std::to_string(index) + " " + binary_note(*left, *right);
             return false;
         }
     }
-    if (it1 != end1 || it2 != end2) {
-        auto s1 = static_cast<long long>(std::distance(std::begin(a), std::end(a)));
-        auto s2 = static_cast<long long>(std::distance(std::begin(b), std::end(b)));
-        note = "size mismatch lhs_size=" + std::to_string(s1) + " rhs_size=" + std::to_string(s2);
+    if (left != left_end || right != right_end) {
+        note = "size mismatch at index " + std::to_string(index);
         return false;
     }
     return true;
 }
-
-#define CH_TEST_CONTAINS_IMPL(fatal, C, E) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    auto&& c__ = (C); \
-    auto&& e__ = (E); \
-    bool ok__ = ::chtest::contains_in(c__, e__); \
-    std::ostringstream expr__; \
-    expr__ << "CONTAINS(" #C "," #E ")  needle=" << ::chtest::to_string_any(e__) << " in=" << ::chtest::to_string_any(c__); \
-    ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_CONTAINS(C,E) CH_TEST_CONTAINS_IMPL(false, C, E)
-#define REQUIRE_CONTAINS(C,E) CH_TEST_CONTAINS_IMPL(true, C, E)
-#define THREAD_REQUIRE_CONTAINS(C,E) \
-    if (::chtest::tls_case_abort) { \
-        CH_TEST_CONTAINS_IMPL(false, C, E); \
-        if (!::chtest::contains_in((C),(E))) *::chtest::tls_case_abort = true; \
-    } else CH_TEST_CONTAINS_IMPL(true, C, E)
-
-#define CH_TEST_SIZE_IMPL(fatal, C, N) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    auto&& c__ = (C); \
-    auto n = static_cast<long long>(N); \
-    auto sz = static_cast<long long>(std::distance(std::begin(c__), std::end(c__))); \
-    bool ok__ = (sz == n); \
-    std::ostringstream expr__; \
-    expr__ << "SIZE(" #C ") expected=" << n << " got=" << sz; \
-    ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), "", fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_SIZE(C,N) CH_TEST_SIZE_IMPL(false, C, N)
-#define REQUIRE_SIZE(C,N) CH_TEST_SIZE_IMPL(true, C, N)
-#define THREAD_REQUIRE_SIZE(C,N) \
-    if (::chtest::tls_case_abort) { \
-        CH_TEST_SIZE_IMPL(false, C, N); \
-        long long _n = static_cast<long long>(N); \
-        long long _sz = static_cast<long long>(std::distance(std::begin((C)), std::end((C)))); \
-        if (_sz != _n) *::chtest::tls_case_abort = true; \
-    } else CH_TEST_SIZE_IMPL(true, C, N)
-
-#define CH_TEST_SEQ_EQ_IMPL(fatal, A, B) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    auto&& a__ = (A); \
-    auto&& b__ = (B); \
-    std::string note__; \
-    bool ok__ = ::chtest::seq_equal_note(a__, b__, note__); \
-    std::ostringstream expr__; \
-    expr__ << "SEQ_EQ(" #A "," #B ")  lhs=" << ::chtest::to_string_any(a__) << " rhs=" << ::chtest::to_string_any(b__); \
-    ::chtest::record_check(ok__, __FILE__, __LINE__, expr__.str(), note__, fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_SEQ_EQ(A,B) CH_TEST_SEQ_EQ_IMPL(false, A, B)
-#define REQUIRE_SEQ_EQ(A,B) CH_TEST_SEQ_EQ_IMPL(true, A, B)
-#define THREAD_REQUIRE_SEQ_EQ(A,B) \
-    if (::chtest::tls_case_abort) { \
-        CH_TEST_SEQ_EQ_IMPL(false, A, B); \
-        std::string _note; \
-        if (!::chtest::seq_equal_note((A),(B), _note)) *::chtest::tls_case_abort = true; \
-    } else CH_TEST_SEQ_EQ_IMPL(true, A, B)
-
-
-// exception assertions
-#define CH_TEST_THROWS_CORE(fatal, EXPR) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    bool threw__ = false; \
-    try { (void)(EXPR); } catch(...) { threw__ = true; } \
-    ::chtest::record_check(threw__, __FILE__, __LINE__, "THROWS(" #EXPR ")", "", fatal, ::chtest::current_quiet()); \
-} while(0)
-#define CH_TEST_NOTHROW_CORE(fatal, EXPR) \
-    if (::chtest::route().mode == ::chtest::SubcaseMode::Discovery || \
-        (::chtest::route().mode == ::chtest::SubcaseMode::Active && ::chtest::route().in_subcase)) \
-do { \
-    bool threw__ = false; \
-    try { (void)(EXPR); } catch(...) { threw__ = true; } \
-    ::chtest::record_check(!threw__, __FILE__, __LINE__, "NOTHROW(" #EXPR ")", "", fatal, ::chtest::current_quiet()); \
-} while(0)
-
-#define CHECK_THROWS(EXPR) CH_TEST_THROWS_CORE(false, EXPR)
-#define CHECK_NOTHROW(EXPR) CH_TEST_NOTHROW_CORE(false, EXPR)
-#define REQUIRE_THROWS(EXPR) CH_TEST_THROWS_CORE(true, EXPR)
-#define REQUIRE_NOTHROW(EXPR) CH_TEST_NOTHROW_CORE(true, EXPR)
+#define CH_TEST_CONTAINS_MODE(MODE, C, E) do { if (::chtest::assertions_enabled()) { \
+    [&](const auto& ch_test_c, const auto& ch_test_e) { \
+    const bool ch_test_ok = ::chtest::contains_in(ch_test_c, ch_test_e); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, "CONTAINS(" #C ", " #E ")", ::chtest::FailureMode::MODE, \
+        [&] { return "needle=" + ::chtest::to_string_any(ch_test_e); }); \
+    }((C), (E)); \
+} } while (false)
+#define CHECK_CONTAINS(C,E) CH_TEST_CONTAINS_MODE(Check, C, E)
+#define REQUIRE_CONTAINS(C,E) CH_TEST_CONTAINS_MODE(Require, C, E)
+#define THREAD_REQUIRE_CONTAINS(C,E) CH_TEST_CONTAINS_MODE(ThreadRequire, C, E)
+#define CH_TEST_SIZE_MODE(MODE, C, N) do { if (::chtest::assertions_enabled()) { \
+    [&](const auto& ch_test_c, const auto& ch_test_n) { const auto ch_test_size = ::chtest::container_size(ch_test_c); \
+    const bool ch_test_ok = ::chtest::compare_values(ch_test_size, ch_test_n, std::equal_to<>{}); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, "SIZE(" #C ", " #N ")", ::chtest::FailureMode::MODE, \
+        [&] { return ::chtest::binary_note(ch_test_size, ch_test_n); }); \
+    }((C), (N)); \
+} } while (false)
+#define CHECK_SIZE(C,N) CH_TEST_SIZE_MODE(Check, C, N)
+#define REQUIRE_SIZE(C,N) CH_TEST_SIZE_MODE(Require, C, N)
+#define THREAD_REQUIRE_SIZE(C,N) CH_TEST_SIZE_MODE(ThreadRequire, C, N)
+#define CH_TEST_SEQ_MODE(MODE, A, B) do { if (::chtest::assertions_enabled()) { \
+    [&](auto&& ch_test_a, auto&& ch_test_b) { std::string ch_test_note; \
+    const bool ch_test_ok = ::chtest::seq_equal_note(ch_test_a, ch_test_b, ch_test_note); \
+    ::chtest::record_assertion(ch_test_ok, __FILE__, __LINE__, "SEQ_EQ(" #A ", " #B ")", ::chtest::FailureMode::MODE, \
+        [&] { return ch_test_note; }); \
+    }((A), (B)); \
+} } while (false)
+#define CHECK_SEQ_EQ(A,B) CH_TEST_SEQ_MODE(Check, A, B)
+#define REQUIRE_SEQ_EQ(A,B) CH_TEST_SEQ_MODE(Require, A, B)
+#define THREAD_REQUIRE_SEQ_EQ(A,B) CH_TEST_SEQ_MODE(ThreadRequire, A, B)
+#define CH_TEST_EXCEPTION(MODE, EXPECTED, EXPR) do { if (::chtest::assertions_enabled()) { \
+    bool ch_test_threw = false; \
+    try { (void)(EXPR); } catch (const ::chtest::AssertionFailure&) { throw; } catch (...) { ch_test_threw = true; } \
+    ::chtest::record_assertion(ch_test_threw == (EXPECTED), __FILE__, __LINE__, #MODE " exception(" #EXPR ")", \
+        ::chtest::FailureMode::MODE, [] { return std::string{}; }); \
+} } while (false)
+#define CHECK_THROWS(EXPR) CH_TEST_EXCEPTION(Check, true, EXPR)
+#define CHECK_NOTHROW(EXPR) CH_TEST_EXCEPTION(Check, false, EXPR)
+#define REQUIRE_THROWS(EXPR) CH_TEST_EXCEPTION(Require, true, EXPR)
+#define REQUIRE_NOTHROW(EXPR) CH_TEST_EXCEPTION(Require, false, EXPR)
+#define THREAD_REQUIRE_THROWS(EXPR) CH_TEST_EXCEPTION(ThreadRequire, true, EXPR)
+#define THREAD_REQUIRE_NOTHROW(EXPR) CH_TEST_EXCEPTION(ThreadRequire, false, EXPR)
 
 // ---------- Output helpers ----------
-inline bool& current_quiet() { static bool q=false; return q; }
+
 
 inline void print_case_start(const std::string& name, int rep_idx, int rep_total) {
     // compose the optional run suffix into a single string so output stays atomic
@@ -1019,13 +1081,16 @@ inline void print_subcase_start(const std::string& name) {
              << "  subcase: " << (Color::instance().enabled ? Color::instance().reset_code() : "")
              << name << "\n";
 }
-inline void print_summary(int cases, int subcases, int checks, int fails, double ms) {
+inline void print_summary(count_type cases, count_type subcases, count_type checks, count_type fails, double ms) {
     ts_cout() << "\n";
     ts_cout() << (Color::instance().enabled ? Color::instance().blue_code() : "")
              << "[chtest] " << (Color::instance().enabled ? Color::instance().reset_code() : "")
              << "cases=" << cases << " subcases=" << subcases
              << " checks=" << checks << " failures=" << fails
              << " time=" << std::fixed << std::setprecision(2) << ms << "ms"
+             << " skipped=" << agg().skipped.load()
+             << " failed_cases=" << agg().failed_cases.load()
+             << " retried_failures=" << agg().retried_failures.load()
              << " timeouts=" << ::chtest::agg().timeouts.load()
              << " retries=" << ::chtest::agg().retries.load() << "\n";
     if (fails == 0) {
@@ -1034,16 +1099,16 @@ inline void print_summary(int cases, int subcases, int checks, int fails, double
         ts_cout() << (Color::instance().enabled ? Color::instance().red_code() : "") << "SOME FAILED\n" << (Color::instance().enabled ? Color::instance().reset_code() : "");
     }
 
-    ts_cout() << (Color::instance().enabled ? Color::instance().blue_code() : "") << "[case timings]\n" << (Color::instance().enabled ? Color::instance().reset_code() : "");
-    for(auto& ct:agg().case_times){
+    if (!agg().case_times.empty()) ts_cout() << (Color::instance().enabled ? Color::instance().blue_code() : "") << "[case timings]\n" << (Color::instance().enabled ? Color::instance().reset_code() : "");
+    for(const auto& ct:agg().case_times.to_vector()){
         ts_cout() << "  " << ct.first << " : " << ct.second << " ms\n";
     }
 
-    ts_cout() << (Color::instance().enabled ? Color::instance().blue_code() : "") << "[subcase timings]\n" << (Color::instance().enabled ? Color::instance().reset_code() : "");
-    for(auto& sct:agg().subcase_times){
+    if (!agg().subcase_times.empty()) ts_cout() << (Color::instance().enabled ? Color::instance().blue_code() : "") << "[subcase timings]\n" << (Color::instance().enabled ? Color::instance().reset_code() : "");
+    for(const auto& sct:agg().subcase_times.to_vector()){
         ts_cout() << "  " << sct.first << " : " << sct.second << " ms\n";
     }
-    if (agg().slow_cases.load() > 0) {
+    if (!agg().slow_case_info.empty()) {
         ts_cout() << (Color::instance().enabled ? Color::instance().yellow_code() : "") << "[slow cases] (threshold set)\n" << (Color::instance().enabled ? Color::instance().reset_code() : "");
         auto infos = agg().slow_case_info.to_vector();
         for (auto &p : infos) ts_cout() << "  " << p.first << " : " << p.second << " ms\n";
@@ -1062,18 +1127,20 @@ static void CH_TEST_FN()
 TEST_CASE_IMPL(NAME, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQUE_NAME(CH_TEST_REG))
 
 // TEST_CASE with tags: usage TEST_CASE_TAG("name", {"fast","io"})
-#define TEST_CASE_TAG_IMPL(NAME, CH_TEST_FN, CH_TEST_REG, TAGSVEC) \
+#define TEST_CASE_TAG_IMPL(NAME, CH_TEST_FN, CH_TEST_REG, ...) \
 static void CH_TEST_FN(); \
-static ::chtest::TestRegistrar CH_TEST_REG{ NAME, CH_TEST_FN, false, std::vector<std::string> TAGSVEC }; \
+static ::chtest::TestRegistrar CH_TEST_REG{ NAME, CH_TEST_FN, false, std::vector<std::string> __VA_ARGS__ }; \
 static void CH_TEST_FN()
 
-#define TEST_CASE_TAG(NAME, TAGSVEC) \
-TEST_CASE_TAG_IMPL(NAME, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQUE_NAME(CH_TEST_REG), TAGSVEC)
+#define TEST_CASE_TAG(NAME, ...) \
+TEST_CASE_TAG_IMPL(NAME, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQUE_NAME(CH_TEST_REG), __VA_ARGS__)
 
 // TEST_F
 #define TEST_F_IMPL(FIXTURE, NAME, CH_TEST_CLASS, CH_TEST_REG) \
 struct CH_TEST_CLASS : public FIXTURE { \
-    static void Run() { CH_TEST_CLASS inst; inst.setUp(); try { inst.body(); } catch(...) { inst.tearDown(); throw; } inst.tearDown(); } \
+    static void Run() { CH_TEST_CLASS inst; inst.setUp(); try { inst.body(); } catch(...) { \
+        ::chtest::invoke_guarded([&] { inst.tearDown(); }, "exception in fixture tearDown"); throw; \
+    } inst.tearDown(); } \
     void body(); \
 }; \
 static ::chtest::TestRegistrar CH_TEST_REG{ NAME, &CH_TEST_CLASS::Run, true }; \
@@ -1082,425 +1149,328 @@ void CH_TEST_CLASS::body()
 #define TEST_F(FIXTURE, NAME) \
 TEST_F_IMPL(FIXTURE, NAME, CH_TEST_UNIQUE_NAME(CH_TEST_CLASS), CH_TEST_UNIQUE_NAME(CH_TEST_REG))
 
-// SUBCASE: single-pass discovery, then active replay matching by name
-// Usage inside TEST_CASE function body:
-//   static constexpr const char* CH_TEST_CURRENT_CASE = "case name"; //
-//   injected automatically below if (subcase_enter("branch")) { ... }
-// #define SUBCASE(NAME) \
-// if (::chtest::subcase_enter(NAME))
 
-#define SUBCASE(NAME) \
-for (bool once=true; once && ::chtest::subcase_enter(NAME); once=false) \
-    for (::chtest::ScopedSubcaseFlag flag; flag.active; flag.active=false)
+// Source location distinguishes sibling subcases with the same display name.
+#define CH_TEST_SUBCASE_IMPL(NAME, ID) \
+    if (::chtest::ScopedSubcaseFlag ID{(NAME), __FILE__, __LINE__}; ID.active)
+#define SUBCASE(NAME) CH_TEST_SUBCASE_IMPL(NAME, CH_TEST_UNIQUE_NAME(ch_test_subcase_))
 
-// TEST_CASE_PARAM: registers each param as its own case calling a function with `param`
-// #define TEST_CASE_PARAM_IMPL(NAME, PARAMS, CH_TEST_FN, CH_TEST_REG) \
-// static void CH_TEST_FN(const decltype(PARAMS)::value_type& param); \
-// static bool CH_TEST_REG = [](){ \
-//     auto values = PARAMS; \
-//     for (size_t i=0;i<values.size();++i) { \
-//         ::chtest::registry().push_back({ \
-//             std::string(NAME) + " [param " + std::to_string(i) + "]", \
-//             [=](){ CH_TEST_FN(values[i]); }, {}, false \
-//         }); \
-//     } \
-//     return true; \
-// }(); \
-// static void CH_TEST_FN(const decltype(PARAMS)::value_type& param)
+// One immutable snapshot is shared by all parameter cases: O(N) storage.
 #define TEST_CASE_PARAM_IMPL(NAME, PARAMS, FN, REG) \
 template <typename T> static void FN(const T& param); \
-static bool REG = [](){ \
-    auto values = PARAMS; \
-    using Elem = typename decltype(values)::value_type; \
-    for (size_t i=0;i<values.size();++i) { \
+static bool REG = [] { \
+    const auto values = std::make_shared<const std::decay_t<decltype(PARAMS)>>(PARAMS); \
+    using Elem = typename std::decay_t<decltype(PARAMS)>::value_type; \
+    for (std::size_t i = 0; i < values->size(); ++i) { \
         ::chtest::registry().push_back({ \
             std::string(NAME) + " [param " + std::to_string(i) + "]", \
-            [=](){ FN<Elem>(values[i]); }, {}, false \
+            [values, i] { FN<Elem>((*values)[i]); }, {}, false, {}, 0, 0, nullptr \
         }); \
     } \
     return true; \
 }(); \
 template <typename T> static void FN(const T& param)
-
 #define TEST_CASE_PARAM(NAME, PARAMS) \
 TEST_CASE_PARAM_IMPL(NAME, PARAMS, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQUE_NAME(CH_TEST_REG))
 
+
 // ---------- CLI parsing ----------
+inline const char* help_text() {
+    return "Options:\n"
+        "  --test <pattern>      case-insensitive case name substring\n"
+        "  --list / --cases       list filtered cases without running hooks\n"
+        "  --repeat N             repeat the suite (N >= 1)\n"
+        "  --shuffle <seed>       shuffle within priority groups\n"
+        "  --threads N            at most N concurrent cases (N >= 1)\n"
+        "  --retries N            retry failed cases up to N times\n"
+        "  --timeout <ms>         cooperative deadline for each case attempt\n"
+        "  --slow-threshold <ms>  report slow cases\n"
+        "  --quiet                suppress successful checks and case banners\n"
+        "  --no-color             disable ANSI colors\n"
+        "  --no-buffer            emit output immediately\n"
+        "  --buffer-limit <bytes> maximum buffered bytes per case (default 65536)\n"
+        "  --timings              collect and print individual timings\n"
+        "  --tag / --tag-any <tags...>  require any listed tag\n"
+        "  --tag-all <tags...>     require all listed tags\n"
+        "  --not-tag <tags...>     exclude any listed tag\n"
+        "  --no-tag               select only untagged tests\n"
+        "  --help / -h            show help\n";
+}
 inline Config parse_args(int argc, char** argv) {
     Config cfg;
     for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto nextS = [&](std::string& dst){ if (i+1 < argc) dst = argv[++i]; };
-        auto nextI = [&](int& dst){ if (i+1 < argc) dst = std::stoi(argv[++i]); };
-        auto nextU = [&](unsigned& dst){ if (i+1 < argc) dst = static_cast<unsigned>(std::stoul(argv[++i])); };
-
-        if (a == "--list") cfg.list_all = true;
-        else if (a == "--cases") cfg.list_cases = true;
-        else if (a == "--repeat") nextI(cfg.repeat);
-        else if (a == "--shuffle") { cfg.shuffle = true; nextU(cfg.seed); }
-        else if (a == "--quiet") cfg.quiet = true;
-        else if (a == "--no-color") cfg.no_color = true;
-        else if (a == "--no-buffer") cfg.no_buffer = true;
-        else if (a == "--test")nextS(cfg.pattern);
-        else if (a == "--tag" || a == "--tag-any") {
-            cfg.tag_mode = Config::TagMode::Any;
-            // consume one or more tag arguments following --tag until the next
-            // option (starting with '-') or end of argv
-            while (i+1 < argc && argv[i+1][0] != '-') {
-                cfg.tags.push_back(std::string(argv[++i]));
-            }
-        }
-        else if (a == "--tag-all") {
-            cfg.tag_mode = Config::TagMode::All;
-            while (i+1 < argc && argv[i+1][0] != '-') {
-                cfg.tags.push_back(std::string(argv[++i]));
-            }
-        }
-        else if (a == "--no-tag") {
-            cfg.tag_mode = Config::TagMode::NoTag;
-        }
-        else if (a == "--not-tag") {
-            cfg.tag_mode = Config::TagMode::NotAny;
-            while (i+1 < argc && argv[i+1][0] != '-') {
-                cfg.tags.push_back(std::string(argv[++i]));
-            }
-        }
-        else if(a=="--timeout") nextI(cfg.timeout_ms);
-        else if(a=="--threads") nextI(cfg.threads);
-        else if(a=="--retries") nextI(cfg.default_retries);
-        else if(a=="--slow-threshold") nextI(cfg.slow_ms);
-        else if (a == "--help" || a == "-h") {
-            ts_cout() <<
-                "Options:\n"
-                "  --test <pattern>   filter case names (substring, case-insensitive)\n"
-                "  --list             list all cases\n"
-                "  --cases            list only case names\n"
-                "  --repeat N         repeat all tests N times\n"
-                "  --shuffle <seed>   shuffle order with seed\n"
-                "  --quiet            suppress per-check OK lines\n"
-                "  --no-color         disable colors\n"
-                "  --no-buffer        disable per-case output buffering\n"
-                "  --tag <tag> / --tag-any <tag>   filter tests to those having any of the given tags (can repeat)\n"
-                "  --tag-all <tag>    require tests to have ALL listed tags\n"
-                "  --not-tag <tag>    exclude tests that have ANY of the listed tags\n"
-                "  --no-tag           run tests that have no tags assigned\n"
-                "  --help             show this help\n"
-                "  --h                same as help\n";
-            std::exit(0);
-        }
+        const std::string_view option(argv[i]);
+        auto next = [&]() -> std::string_view {
+            if (i + 1 >= argc || std::string_view(argv[i + 1]).substr(0, 2) == "--")
+                throw std::invalid_argument("missing value for " + std::string(option));
+            return argv[++i];
+        };
+        auto number = [&](auto& destination, bool positive = false) {
+            auto value = next();
+            using Value = std::decay_t<decltype(destination)>;
+            Value parsed{};
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
+                parsed < 0 || (positive && parsed == 0))
+                throw std::invalid_argument("invalid value for " + std::string(option) + ": " + std::string(value));
+            destination = parsed;
+        };
+        auto tags = [&](std::vector<std::string>& destination, Config::TagMode mode) {
+            const auto before = destination.size();
+            while (i + 1 < argc && argv[i + 1][0] != '-') destination.emplace_back(argv[++i]);
+            if (before == destination.size()) throw std::invalid_argument("missing tags for " + std::string(option));
+            cfg.tag_mode = mode;
+            cfg.tags.assign(destination.begin(), destination.end());
+        };
+        if (option == "--help" || option == "-h") cfg.help = true;
+        else if (option == "--list") cfg.list_all = true;
+        else if (option == "--cases") cfg.list_cases = true;
+        else if (option == "--test") cfg.pattern = next();
+        else if (option == "--repeat") number(cfg.repeat, true);
+        else if (option == "--threads") number(cfg.threads, true);
+        else if (option == "--retries") number(cfg.default_retries);
+        else if (option == "--timeout") number(cfg.timeout_ms);
+        else if (option == "--slow-threshold") number(cfg.slow_ms);
+        else if (option == "--buffer-limit") number(cfg.buffer_limit, true);
+        else if (option == "--shuffle") { number(cfg.seed); cfg.shuffle = true; }
+        else if (option == "--quiet") cfg.quiet = true;
+        else if (option == "--no-color") cfg.no_color = true;
+        else if (option == "--no-buffer") cfg.no_buffer = true;
+        else if (option == "--timings") cfg.timings = true;
+        else if (option == "--tag" || option == "--tag-any") tags(cfg.any_tags, Config::TagMode::Any);
+        else if (option == "--tag-all") tags(cfg.all_tags, Config::TagMode::All);
+        else if (option == "--not-tag") tags(cfg.excluded_tags, Config::TagMode::NotAny);
+        else if (option == "--no-tag") { cfg.untagged_only = true; cfg.tag_mode = Config::TagMode::NoTag; }
+        else throw std::invalid_argument("unknown option: " + std::string(option));
     }
     return cfg;
 }
 
+inline void reset_aggregates() {
+    auto& a = agg();
+    a.cases = 0; a.subcases = 0; a.checks = 0; a.failures = 0;
+    a.timeouts = 0; a.retries = 0; a.slow_cases = 0;
+    a.skipped = 0; a.failed_cases = 0; a.retried_failures = 0;
+    a.case_times.clear(true); a.subcase_times.clear(true); a.slow_case_info.clear(true);
+}
+
+// The test stays on its worker (including environment hooks). A watchdog sets
+// the shared abort flag; it never detaches or destroys a running test's state.
+class AttemptDeadline {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    std::thread watchdog;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    int timeout;
+    std::atomic<bool>& abort;
+    std::atomic<bool> expired{false};
+public:
+    AttemptDeadline(int milliseconds, std::atomic<bool>& flag) : timeout(milliseconds), abort(flag) {
+        if (timeout > 0) watchdog = std::thread([this] {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!cv.wait_until(lock, start + std::chrono::milliseconds(timeout), [this] { return done; })) {
+                expired.store(true, std::memory_order_relaxed);
+                abort.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+    bool finish() {
+        if (timeout <= 0) return false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!done && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout)) {
+                expired.store(true, std::memory_order_relaxed);
+                abort.store(true, std::memory_order_relaxed);
+            }
+            done = true;
+        }
+        cv.notify_one();
+        if (watchdog.joinable()) watchdog.join();
+        return expired.load(std::memory_order_relaxed);
+    }
+    ~AttemptDeadline() { finish(); }
+};
+inline double elapsed_ms(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
+    ContextRestore restore;
+    // Aliasing shared_ptrs retain the same thread-safe lifetimes with one
+    // allocation for the case's signals and output storage.
+    struct CaseStorage {
+        PerCaseBuffer output;
+        std::atomic<bool> abort{false};
+        std::atomic<count_type> failures{0};
+    };
+    auto storage = std::make_shared<CaseStorage>();
+    std::optional<case_output_collector> collector;
+    if (!cfg.no_buffer) collector.emplace(std::shared_ptr<PerCaseBuffer>(storage, &storage->output), cfg.buffer_limit);
+    auto abort = std::shared_ptr<std::atomic<bool>>(storage, &storage->abort);
+    auto failures = std::shared_ptr<std::atomic<count_type>>(storage, &storage->failures);
+    tls_case_abort_keep = abort; tls_case_abort = abort.get();
+    tls_case_fail_count_keep = failures; tls_case_fail_count = failures.get();
+    route() = RouteState{};
+    if (test.skip_if) {
+        bool skip = false;
+        if (!invoke_guarded([&] { skip = test.skip_if(); }, "exception in skip predicate")) {
+            agg().cases.fetch_add(1, std::memory_order_relaxed);
+            agg().failed_cases.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (skip) {
+            agg().skipped.fetch_add(1, std::memory_order_relaxed);
+            if (!cfg.quiet) ts_cout() << "skipping case at runtime: " << test.name << "\n";
+            return;
+        }
+    }
+    const bool measure_case = cfg.timings || cfg.slow_ms > 0;
+    const auto start = measure_case ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (!cfg.quiet) print_case_start(test.name, repeat_index, cfg.repeat);
+    const int retries = test.retries > 0 ? test.retries : cfg.default_retries;
+    for (int attempt = 0; ; ++attempt) {
+        abort->store(false, std::memory_order_relaxed);
+        failures->store(0, std::memory_order_relaxed);
+        test.subcases.clear();
+        SubcaseIndex subcase_index;
+        std::optional<AttemptDeadline> deadline;
+        if (cfg.timeout_ms > 0) deadline.emplace(cfg.timeout_ms, *abort);
+        route() = RouteState{};
+        route().mode = SubcaseMode::Discovery;
+        route().current_case = &test;
+        route().discovery_index = &subcase_index;
+        auto* env = global_env();
+        const bool setup_ok = !env || invoke_guarded([&] { env->setUp(); }, "exception in environment setUp");
+        if (setup_ok) {
+            // The outer guard guarantees environment cleanup even if routing or
+            // timing allocation fails. Each user execution has its own guard.
+            invoke_guarded([&] {
+                const bool discovered = invoke_guarded(test.fn, "uncaught exception in case discovery");
+                if (discovered && !abort->load(std::memory_order_relaxed)) {
+                    for (std::size_t i = 0; i < test.subcases.size(); ++i) {
+                        if (abort->load(std::memory_order_relaxed)) break;
+                        // Nested discovery can reallocate the vector; keep this path stable.
+                        const auto subcase = test.subcases[i];
+                        if (!cfg.quiet) print_subcase_start(subcase.name);
+                        agg().subcases.fetch_add(1, std::memory_order_relaxed);
+                        route().mode = SubcaseMode::Active;
+                        route().active_path = &subcase.path;
+                        route().active_name = subcase.name.c_str();
+                        route().path.clear();
+                        route().entered_depth = 0;
+                        route().in_subcase = false;
+                        const auto subcase_start = cfg.timings ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                        invoke_guarded(test.fn, "uncaught exception in subcase");
+                        route().active_path = nullptr;
+                        route().active_name = nullptr;
+                        if (cfg.timings) agg().subcase_times.push_back({test.name + " :: " + subcase.name, elapsed_ms(subcase_start)});
+                    }
+                }
+            }, "exception while executing case");
+            route() = RouteState{};
+            route().mode = SubcaseMode::Discovery; // hook assertions are recorded once per attempt
+            if (env) invoke_guarded([&] { env->tearDown(); }, "exception in environment tearDown");
+        }
+        route() = RouteState{};
+        if (deadline && deadline->finish()) {
+            record_check(false, __FILE__, __LINE__, "case timeout: " + test.name,
+                         "exceeded " + std::to_string(cfg.timeout_ms) + "ms (cooperative deadline)", false, cfg.quiet);
+            agg().timeouts.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto count = failures->load(std::memory_order_relaxed);
+        if (count == 0 || attempt >= retries) break;
+        agg().failures.fetch_sub(count, std::memory_order_relaxed);
+        agg().retried_failures.fetch_add(count, std::memory_order_relaxed);
+        agg().retries.fetch_add(1, std::memory_order_relaxed);
+        if (!cfg.quiet) ts_cout() << "  retrying case: " << test.name << " (retry " << attempt + 1 << ")\n";
+    }
+    if (failures->load(std::memory_order_relaxed) > 0) agg().failed_cases.fetch_add(1, std::memory_order_relaxed);
+    const double duration = measure_case ? elapsed_ms(start) : 0;
+    if (cfg.slow_ms > 0 && duration > cfg.slow_ms) {
+        agg().slow_cases.fetch_add(1, std::memory_order_relaxed);
+        ts_cout() << "  SLOW: case '" << test.name << "' took " << duration << " ms\n";
+        if (cfg.timings) agg().slow_case_info.push_back({test.name, duration});
+    }
+    if (cfg.timings) agg().case_times.push_back({test.name, duration});
+    // Discovered paths belong to this invocation, not the permanent registry.
+    std::vector<Subcase>().swap(test.subcases);
+    agg().cases.fetch_add(1, std::memory_order_relaxed);
+}
+
 // ---------- Runner ----------
 inline int run(int argc, char** argv) {
-    auto cfg = parse_args(argc, argv);
+    // Global registry/configuration permit one run at a time; never deadlock a
+    // nested invocation from a test or an output sink.
+    static std::mutex run_mutex;
+    std::unique_lock<std::mutex> running(run_mutex, std::try_to_lock);
+    if (!running.owns_lock()) return 2;
+    reset_aggregates();
+    output_failed().store(false, std::memory_order_relaxed);
+    Config cfg;
+    try { cfg = parse_args(argc, argv); }
+    catch (const std::exception& e) { ts_cout() << "[chtest] " << e.what() << "\nUse --help for options.\n"; return 2; }
+    if (cfg.help) { ts_cout() << help_text(); return output_failed() ? 1 : 0; }
     Color::instance().set_enabled(!cfg.no_color);
     current_quiet() = cfg.quiet;
-
-    if (cfg.no_buffer) {
-        // Best-effort: ensure output is visible even if the process terminates abruptly.
-        std::setvbuf(stdout, nullptr, _IONBF, 0);
-        std::setvbuf(stderr, nullptr, _IONBF, 0);
-        std::ios::sync_with_stdio(true);
-        std::cout.setf(std::ios::unitbuf);
-        std::cerr.setf(std::ios::unitbuf);
-    }
-
-    // Build indices with filter
     auto& tests = registry();
-    std::vector<int> indices;
-    auto match = [&](const std::string& s, const std::string& p) {
-        if (p.empty()) return true;
-        auto lower = [](std::string v){ for (auto& ch : v) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); return v; };
-        return lower(s).find(lower(p)) != std::string::npos;
+    std::vector<std::size_t> indices;
+    indices.reserve(tests.size());
+    const auto equal_folded = [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
     };
-    for (int i = 0; i < (int)tests.size(); ++i) {
-        if (!match(tests[i].name, cfg.pattern)) continue;
-        // dynamic skip: if a runtime predicate is provided and returns true, skip this case
-        if (tests[i].skip_if) {
-            bool do_skip = false;
-            try { do_skip = tests[i].skip_if(); } catch(...) { do_skip = false; }
-            if (do_skip) {
-                if (!cfg.quiet) ts_cout() << "skipping case at runtime: " << tests[i].name << "\n";
-                continue;
-            }
-        }
-        // Tag filtering modes
-        if (cfg.tag_mode == Config::TagMode::NoTag) {
-            if (!tests[i].tags.empty()) continue;
-        } else if (cfg.tag_mode == Config::TagMode::Any) {
-            if (!cfg.tags.empty()) {
-                bool has = false;
-                for (auto &tf: cfg.tags) {
-                    for (auto &tt: tests[i].tags) {
-                        if (tf == tt) { has = true; break; }
-                    }
-                    if (has) break;
-                }
-                if (!has) continue;
-            }
-        } else if (cfg.tag_mode == Config::TagMode::All) {
-            if (!cfg.tags.empty()) {
-                bool all_ok = true;
-                for (auto &tf: cfg.tags) {
-                    bool found = false;
-                    for (auto &tt: tests[i].tags) {
-                        if (tf == tt) { found = true; break; }
-                    }
-                    if (!found) { all_ok = false; break; }
-                }
-                if (!all_ok) continue;
-            }
-        } else if (cfg.tag_mode == Config::TagMode::NotAny) {
-            if (!cfg.tags.empty()) {
-                bool any_found = false;
-                for (auto &tf: cfg.tags) {
-                    for (auto &tt: tests[i].tags) {
-                        if (tf == tt) { any_found = true; break; }
-                    }
-                    if (any_found) break;
-                }
-                if (any_found) continue; // exclude tests that have any of the given tags
-            }
-        }
+    for (std::size_t i = 0; i < tests.size(); ++i) {
+        const auto& test = tests[i];
+        if (!cfg.pattern.empty() && std::search(test.name.begin(), test.name.end(), cfg.pattern.begin(), cfg.pattern.end(), equal_folded) == test.name.end()) continue;
+        const auto has_tag = [&](const std::string& tag) { return std::find(test.tags.begin(), test.tags.end(), tag) != test.tags.end(); };
+        if (cfg.untagged_only && !test.tags.empty()) continue;
+        if (!cfg.any_tags.empty() && std::none_of(cfg.any_tags.begin(), cfg.any_tags.end(), has_tag)) continue;
+        if (!std::all_of(cfg.all_tags.begin(), cfg.all_tags.end(), has_tag)) continue;
+        if (std::any_of(cfg.excluded_tags.begin(), cfg.excluded_tags.end(), has_tag)) continue;
         indices.push_back(i);
     }
-
-    // Shuffle if requested
-    if (cfg.shuffle) {
-        std::mt19937 rng(cfg.seed);
-        std::shuffle(indices.begin(), indices.end(), rng);
-    }
-
-    // Priority scheduling: stable sort by priority descending so higher priority runs first
-    std::stable_sort(indices.begin(), indices.end(), [&](int a, int b){
-        return tests[a].priority > tests[b].priority;
-    });
-
-    // Listing
+    if (cfg.shuffle) { std::mt19937 rng(cfg.seed); std::shuffle(indices.begin(), indices.end(), rng); }
+    std::stable_sort(indices.begin(), indices.end(), [&](auto a, auto b) { return tests[a].priority > tests[b].priority; });
     if (cfg.list_all || cfg.list_cases) {
-        if (cfg.list_all || cfg.list_cases) {
-            Color::instance().blue(); ts_cout() << "[cases]\n"; Color::instance().reset();
-            for (int idx : indices) ts_cout() << "  " << tests[idx].name << "\n";
-        }
-        return 0;
+        ts_cout() << "[cases]\n";
+        for (const auto index : indices) ts_cout() << "  " << tests[index].name << "\n";
+        return output_failed() ? 1 : 0;
     }
-
-    auto t_begin = std::chrono::steady_clock::now();
-    // int exit_failures = 0;
-
-    std::mutex out_mutex;
-
-
-
-    for (int r = 0; r < std::max(1, cfg.repeat); ++r) {
-
-        auto worker =
-            [&](int idx) {
-                auto& T = tests[idx];
-                // Collect all output produced while running this case into
-                // a per-case buffer and flush it atomically at the end.
-                // In --no-buffer mode, write directly to stdout so output is
-                // visible even if the process hard-crashes mid-case.
-                std::unique_ptr<::chtest::case_output_collector> case_out_collector;
-                if (!cfg.no_buffer) {
-                    case_out_collector = std::make_unique<::chtest::case_output_collector>();
+    const auto start = std::chrono::steady_clock::now();
+    for (int repeat = 0; repeat < cfg.repeat; ++repeat) {
+        auto worker = [&](std::size_t index) {
+            invoke_guarded([&] { execute_case(tests[index], cfg, repeat); }, "internal case execution error");
+        };
+        const auto count = std::min(indices.size(), static_cast<std::size_t>(cfg.threads));
+        if (count <= 1) { for (const auto index : indices) worker(index); }
+        else {
+            std::atomic<std::size_t> next{0};
+            auto consume = [&] {
+                for (;;) {
+                    const auto position = next.fetch_add(1, std::memory_order_relaxed);
+                    if (position >= indices.size()) break;
+                    worker(indices[position]);
                 }
-                // Install a per-case abort flag and keep it alive for the
-                // duration of this case execution. child threads that
-                // inherit context will capture this shared_ptr and thus
-                // will be able to set the abort flag via THREAD_REQUIRE.
-                auto case_abort = ::chtest::make_case_abort();
-                // per-case fail counter to attribute failures to this case
-                auto case_fail_count = std::make_shared<std::atomic<int>>(0);
-                struct AbortKeeper {
-                    std::shared_ptr<std::atomic<bool>> prev_abort_keep;
-                    std::atomic<bool>* prev_abort_ptr;
-                    std::shared_ptr<std::atomic<int>> prev_fail_keep;
-                    std::atomic<int>* prev_fail_ptr;
-                    AbortKeeper(std::shared_ptr<std::atomic<bool>> new_abort_keep,
-                                std::shared_ptr<std::atomic<int>> new_fail_keep) {
-                        prev_abort_keep = ::chtest::tls_case_abort_keep;
-                        prev_abort_ptr = ::chtest::tls_case_abort;
-                        prev_fail_keep = ::chtest::tls_case_fail_count_keep;
-                        prev_fail_ptr = ::chtest::tls_case_fail_count;
-                        ::chtest::tls_case_abort_keep = new_abort_keep;
-                        ::chtest::tls_case_abort = new_abort_keep.get();
-                        ::chtest::tls_case_fail_count_keep = new_fail_keep;
-                        ::chtest::tls_case_fail_count = new_fail_keep.get();
-                    }
-                    ~AbortKeeper() {
-                        ::chtest::tls_case_abort = prev_abort_ptr;
-                        ::chtest::tls_case_abort_keep = prev_abort_keep;
-                        ::chtest::tls_case_fail_count = prev_fail_ptr;
-                        ::chtest::tls_case_fail_count_keep = prev_fail_keep;
-                    }
-                } abort_keeper(case_abort, case_fail_count);
-                if (!cfg.quiet) print_case_start(T.name, r, cfg.repeat);
-                auto case_start = std::chrono::steady_clock::now();
-
-                if (global_env()) global_env()->setUp();
-
-                // Determine number of attempts: 1 + retries
-                int per_case_retries = (T.retries > 0) ? T.retries : cfg.default_retries;
-                int max_attempts = 1 + per_case_retries;
-
-                for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-                    if (!cfg.quiet) ts_cout() << "  attempt " << attempt << "/" << max_attempts << "\n";
-
-                    // reset abort flag for this attempt
-                    case_abort->store(false);
-
-                    // clear previously discovered subcases to avoid duplication on retry
-                    T.subcases.clear();
-
-                    // capture per-case failures before attempt so we can detect new failures attributed to this case
-                    int fails_before = case_fail_count->load();
-
-                    // Single-pass discovery + base assertions
-                    route().mode = SubcaseMode::Discovery;
-                    route().current_case = &T;
-                    route().active_name = nullptr;
-                    try {
-                        T.fn();  // registers subcases and runs base assertions once
-                    } catch (const std::exception& e) {
-                        record_check(false, __FILE__, __LINE__,
-                                    "uncaught exception in case discovery", e.what(),
-                                    false, cfg.quiet);
-                    } catch (...) {
-                        record_check(false, __FILE__, __LINE__,
-                                    "uncaught non-std exception in case discovery", "",
-                                    false, cfg.quiet);
-                    }
-                    route().mode = SubcaseMode::Normal;
-                    route().current_case = nullptr;
-
-                    // Execute each subcase path independently
-                    for (auto& sc : T.subcases) {
-                        if (!cfg.quiet) print_subcase_start(sc.name);
-                        agg().subcases++;
-                        route().mode = SubcaseMode::Active;
-                        route().active_name = sc.name.c_str();
-                        auto sc_start = std::chrono::steady_clock::now();
-
-                        if (cfg.timeout_ms > 0) {
-                            // Run the subcase in an async task so we can enforce a
-                            // timeout. Use a per-subcase abort flag so child threads
-                            // can cooperatively stop when timeout occurs.
-                            auto sub_abort = ::chtest::make_case_abort();
-                            auto wrapped = ::chtest::with_current_case_context([&T]() {
-                                try {
-                                    T.fn();
-                                } catch (const std::exception& e) {
-                                    ::chtest::record_check(false, __FILE__, __LINE__,
-                                                              "uncaught exception in subcase",
-                                                              e.what(), false, ::chtest::current_quiet());
-                                } catch (...) {
-                                    ::chtest::record_check(false, __FILE__, __LINE__,
-                                                              "uncaught non-std exception in subcase",
-                                                              "", false, ::chtest::current_quiet());
-                                }
-                            }, sub_abort);
-
-                            auto fut = std::async(std::launch::async, std::move(wrapped));
-                            if (fut.wait_for(std::chrono::milliseconds(cfg.timeout_ms)) == std::future_status::timeout) {
-                                // signal abort to cooperative child threads
-                                sub_abort->store(true);
-                                ::chtest::record_check(false, __FILE__, __LINE__, "subcase timeout: [" + T.name + " :: " + sc.name + "]",
-                                                          "exceeded " + std::to_string(cfg.timeout_ms) + "ms",
-                                                          false, cfg.quiet);
-                                ::chtest::agg().timeouts++;
-                            } else {
-                                // completed in time: rethrow any exception from the task
-                                try {
-                                    fut.get();
-                                } catch (const std::exception& e) {
-                                    ::chtest::record_check(false, __FILE__, __LINE__,
-                                                              "uncaught exception in subcase",
-                                                              e.what(), false, cfg.quiet);
-                                } catch (...) {
-                                    ::chtest::record_check(false, __FILE__, __LINE__,
-                                                              "uncaught non-std exception in subcase",
-                                                              "", false, cfg.quiet);
-                                }
-                            }
-                        } else {
-                            try {
-                                T.fn();
-                            } catch (const std::exception& e) {
-                                record_check(false, __FILE__, __LINE__,
-                                            "uncaught exception in subcase", e.what(), false,
-                                            cfg.quiet);
-                            } catch (...) {
-                                record_check(false, __FILE__, __LINE__,
-                                            "uncaught non-std exception in subcase", "", false,
-                                            cfg.quiet);
-                            }
-                        }
-                        auto sc_end = std::chrono::steady_clock::now();
-                        double sc_ms =
-                            std::chrono::duration<double, std::milli>(sc_end - sc_start)
-                                .count();
-                        agg().subcase_times.push_back({T.name + " :: " + sc.name, sc_ms});
-                        route().mode = SubcaseMode::Normal;
-                        route().active_name = nullptr;
-                    }
-
-                    if (global_env()) global_env()->tearDown();
-
-                    // if this case produced any failures during this attempt, consider retrying
-                    int fails_after = case_fail_count->load();
-                    bool failed = (fails_after > fails_before);
-                    if (failed && attempt < max_attempts) {
-                        if (!cfg.quiet) ts_cout() << "  case failed, will retry: " << T.name << " (next attempt " << (attempt+1) << ")\n";
-                        ::chtest::agg().retries++;
-                        // continue to next attempt
-                        continue;
-                    }
-                    // either success or no more attempts
-                    break;
-                }
-
-                auto case_end=std::chrono::steady_clock::now();
-                double case_ms=std::chrono::duration<double,std::milli>(case_end-case_start).count();
-                if(cfg.timeout_ms>0 && case_ms>cfg.timeout_ms){
-                    record_check(false, __FILE__, __LINE__, "case timeout: [" + T.name + "]",
-                                "exceeded " + std::to_string(cfg.timeout_ms) + "ms",
-                                false, cfg.quiet);
-                    ::chtest::agg().timeouts++;
-                }
-                // slow-case detection: non-fatal marking and record
-                if (cfg.slow_ms > 0 && case_ms > cfg.slow_ms) {
-                    // print a colored SLOW notice
-                    ts_cout() << (Color::instance().enabled ? Color::instance().yellow_code() : "")
-                             << "  SLOW: case '" << T.name << "' took " << std::fixed << std::setprecision(2) << case_ms
-                             << " ms (threshold " << cfg.slow_ms << " ms)\n"
-                             << (Color::instance().enabled ? Color::instance().reset_code() : "");
-                    ::chtest::agg().slow_cases++;
-                    ::chtest::agg().slow_case_info.push_back({T.name, case_ms});
-                }
-                agg().case_times.push_back({T.name,case_ms});
-                agg().cases++;
             };
-        
-    // 并发执行
-        std::vector<std::future<void>> futures;
-        for(int idx:indices){
-            if(cfg.threads>1){
-                futures.push_back(std::async(std::launch::async,worker,idx));
-            }else{
-                worker(idx);
+            std::vector<std::thread> workers;
+            // Joining on partial thread-creation failure avoids std::terminate.
+            struct Join { std::vector<std::thread>& threads; ~Join() { for (auto& thread : threads) if (thread.joinable()) thread.join(); } } join{workers};
+            try {
+                workers.reserve(count - 1);
+                for (std::size_t i = 1; i < count; ++i) workers.emplace_back(consume);
+            } catch (const std::exception& e) {
+                record_check(false, __FILE__, __LINE__, "could not start all workers", e.what(), false, cfg.quiet);
             }
+            consume(); // the calling thread is one of the bounded workers
         }
-        for(auto& f:futures) f.get();
     }
-
-    auto t_end = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t_end - t_begin).count();
-    print_summary(agg().cases, agg().subcases, agg().checks, agg().failures, ms);
-
-    return agg().failures==0?0:1;
+    print_summary(agg().cases, agg().subcases, agg().checks, agg().failures, elapsed_ms(start));
+    if (cfg.no_buffer) {
+        try {
+            std::cout.flush();
+            if (!std::cout) output_failed().store(true, std::memory_order_relaxed);
+        } catch (...) { output_failed().store(true, std::memory_order_relaxed); }
+    }
+    return agg().failures == 0 && !output_failed() ? 0 : 1;
 }
 
 } // namespace chtest
