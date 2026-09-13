@@ -34,18 +34,23 @@ def pin_cpu(cpu):
         raise ValueError("CPU affinity is not supported on this platform")
 
 
-def measure(executable, mode):
+MODES = ("assertions", "params", "scheduler", "output", "output-small-buffer", "output-formatted", "subcases")
+
+
+def measure(executable, mode, repetitions=1):
     env = dict(os.environ, CHTEST_BENCHMARK_PARAMS="512" if mode == "params" else "0")
-    result = subprocess.run([str(executable), mode], env=env, check=True,
+    result = subprocess.run([str(executable), mode, str(repetitions)], env=env, check=True,
                             capture_output=True, text=True, timeout=60)
     values = {}
     for field in result.stdout.strip().split():
         key, value = field.split("=", 1)
         values[key] = value if key == "mode" else float(value)
-    expected_checks = {"assertions": 200000, "params": 512, "scheduler": 4096, "output": 0, "subcases": 512}
-    if values.get("mode") != mode or values.get("checks") != expected_checks[mode]:
+    expected_checks = {"assertions": 200000, "params": 512, "scheduler": 4096, "output": 0,
+                       "output-small-buffer": 0, "output-formatted": 0, "subcases": 512}
+    if values.get("mode") != mode or values.get("checks") != expected_checks[mode] * repetitions:
         raise RuntimeError(f"{executable}: unexpected workload for {mode}: {values}")
-    if mode == "output" and values.get("output_bytes", 0) < 12800000:
+    output_bytes = {"output": 12800000, "output-small-buffer": 12800000, "output-formatted": 81978890}
+    if mode in output_bytes and values.get("output_bytes", 0) < output_bytes[mode] * repetitions:
         raise RuntimeError(f"{executable}: output workload was not fully emitted")
     return values
 
@@ -55,28 +60,32 @@ def main():
     parser.add_argument("--before", type=Path, required=True)
     parser.add_argument("--after", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=7)
+    parser.add_argument("--repetitions", type=int, default=1, help="repeat the workload inside each measured run (1-1000)")
     parser.add_argument("--cpu", type=int, help="pin probes to one allowed logical CPU, useful on hybrid CPUs")
-    parser.add_argument("--modes", nargs="+", choices=("assertions", "params", "scheduler", "output", "subcases"),
+    parser.add_argument("--modes", nargs="+", choices=MODES,
                         default=("assertions", "params", "scheduler", "output"))
     parser.add_argument("--output", type=Path, default=Path("build/benchmark-results.json"))
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
+    if not 1 <= args.repetitions <= 1000:
+        parser.error("--repetitions must be between 1 and 1000")
     if args.cpu is not None:
         try:
             pin_cpu(args.cpu)
         except (ValueError, OSError) as error:
             parser.error(str(error))
     executables = {"before": args.before.resolve(strict=True), "after": args.after.resolve(strict=True)}
-    report = {"runs": args.runs, "cpu": args.cpu, "executables": {key: str(value) for key, value in executables.items()}, "results": {}}
+    report = {"runs": args.runs, "repetitions": args.repetitions, "cpu": args.cpu,
+              "executables": {key: str(value) for key, value in executables.items()}, "results": {}}
     report["executable_sha256"] = {key: hashlib.sha256(value.read_bytes()).hexdigest() for key, value in executables.items()}
     for mode in args.modes:
         samples = {key: [] for key in executables}
         for executable in executables.values():
-            measure(executable, mode)  # warmup excluded from statistics
+            measure(executable, mode, args.repetitions)  # warmup excluded from statistics
         for index in range(args.runs):
             for key in (list(executables) if index % 2 == 0 else list(reversed(executables))):
-                samples[key].append(measure(executables[key], mode))
+                samples[key].append(measure(executables[key], mode, args.repetitions))
         summaries = {key: {field: statistics.median(sample[field] for sample in rows)
                            for field in rows[0] if field != "mode"} for key, rows in samples.items()}
         report["results"][mode] = {"median": summaries, "samples": samples}

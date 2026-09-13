@@ -8,7 +8,8 @@
 namespace allocation_probe {
 struct Header { void* base; std::size_t bytes; bool tracked; };
 inline thread_local bool enabled = false;
-inline std::atomic<std::size_t> allocations{0}, live{0}, peak{0};
+inline thread_local std::size_t large_threshold = 1024;
+inline std::atomic<std::size_t> allocations{0}, large_allocations{0}, live{0}, peak{0};
 void* allocate(std::size_t bytes, std::size_t alignment) {
     alignment = std::max(alignment, alignof(Header));
     const auto overhead = sizeof(Header) + alignment - 1;
@@ -21,6 +22,7 @@ void* allocate(std::size_t bytes, std::size_t alignment) {
     ::new (header) Header{base, bytes, enabled};
     if (enabled) {
         allocations.fetch_add(1);
+        if (bytes >= large_threshold) large_allocations.fetch_add(1);
         const auto current = live.fetch_add(bytes) + bytes;
         auto before = peak.load();
         while (current > before && !peak.compare_exchange_weak(before, current)) {}
@@ -34,7 +36,9 @@ void release(void* pointer) noexcept {
     std::free(header->base);
 }
 struct Scope {
-    Scope() { allocations = 0; peak = live.load(); enabled = true; }
+    explicit Scope(std::size_t threshold = 1024) {
+        allocations = 0; large_allocations = 0; peak = live.load(); large_threshold = threshold; enabled = true;
+    }
     ~Scope() { enabled = false; }
 };
 }
@@ -128,6 +132,58 @@ void mock_memory() {
     expect(allocation_probe::peak < 128 * 1024, "bounded argument history stays below a fixed allocation budget");
     expect(allocation_probe::live == 0, "mock destruction releases tracked history and payloads");
 }
+void buffer_reuse() {
+    std::size_t received = 0;
+    chtest::set_output_sink([&](std::string_view text) { received += text.size(); });
+    const std::string message(128, 'x');
+    {
+        allocation_probe::Scope scope;
+        {
+            chtest::case_output_collector collector(1024);
+            for (int i = 0; i < 10000; ++i) chtest::append_output(collector.buf.get(), message);
+        }
+    }
+    std::cout << "buffer payload allocations=" << allocation_probe::large_allocations << '\n';
+    expect(received == 1280000, "buffer reuse emits every byte");
+    expect(allocation_probe::large_allocations < 16, "serial chunk flushes reuse allocated payload storage");
+    expect(allocation_probe::peak < 8192, "reusable buffer keeps a bounded allocation peak");
+    expect(allocation_probe::live == 0, "collector destruction releases reusable payload storage");
+    chtest::clear_output_sink();
+}
+void formatted_snapshot() {
+    std::size_t received = 0;
+    chtest::set_output_sink([&](std::string_view text) { received += text.size(); });
+    const std::string payload(8192, 'x');
+    auto message = std::make_unique<chtest::ts_ostream_proxy>();
+    *message << 42 << ':' << payload;
+    {
+        allocation_probe::Scope scope;
+        message.reset();
+    }
+    expect(received == 8195, "formatted snapshot preserves full output");
+#if (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L) || __cplusplus >= 202002L
+    expect(allocation_probe::large_allocations == 0, "C++20 formatted output uses the stream view without a payload copy");
+#endif
+    chtest::clear_output_sink();
+}
+void replay_storage() {
+    verification::reset();
+    std::vector<std::string> names;
+    for (int i = 0; i < 16; ++i) names.push_back(std::string(8192, 'x') + std::to_string(i));
+    verification::add("long paths", [&] {
+        for (const auto& name : names) SUBCASE(name.c_str()) { CHECK(true); }
+    });
+    chtest::set_output_sink([](std::string_view) {});
+    int result;
+    {
+        allocation_probe::Scope scope(8192);
+        result = verification::run();
+    }
+    expect(result == 0 && chtest::agg().subcases == 16, "long paths replay correctly");
+    expect(allocation_probe::large_allocations <= 64, "replay does not copy the leaf display name twice");
+    verification::reset();
+    chtest::route() = chtest::RouteState{};
+}
 void repeated_runs() {
     verification::reset();
     verification::add("dynamic path retention", [] {
@@ -160,11 +216,35 @@ void repeated_runs() {
     }
     std::cout << "retained run metadata bytes=" << retained << '\n';
 }
+void sparse_filters() {
+    verification::reset();
+    for (int i = 0; i < 4096; ++i)
+        verification::add("unselected case " + std::to_string(i), [] { CHECK(true); });
+    verification::add("needle", [] { CHECK(true); });
+    chtest::set_output_sink([](std::string_view) {});
+    expect(verification::run({"--test", "needle"}) == 0, "warm up filtered runner");
+    {
+        allocation_probe::Scope scope;
+        expect(verification::run({"--test", "needle"}) == 0 && chtest::agg().cases == 1,
+               "sparse filter selects exactly the matching case");
+    }
+    expect(allocation_probe::peak < 8192, "sparse filter does not reserve indices for the entire registry");
+    {
+        allocation_probe::Scope scope;
+        expect(verification::run({"--test", "absent"}) == 0 && chtest::agg().cases == 0,
+               "empty selection executes no cases");
+    }
+    expect(allocation_probe::peak < 8192, "empty selection does not allocate a registry-sized index");
+}
 }
 int main() {
     return verification::main("allocation contracts", [] {
         fast_paths();
+        buffer_reuse();
+        formatted_snapshot();
+        replay_storage();
         mock_memory();
         repeated_runs();
+        sparse_filters();
     });
 }

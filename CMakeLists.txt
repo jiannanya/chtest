@@ -75,7 +75,7 @@ if(CHTEST_BUILD_TESTS)
     chtest_configure_target(chtest_regressions)
     add_executable(chtest_failure_examples test/failure_examples.cpp)
     chtest_configure_target(chtest_failure_examples)
-    foreach(target IN ITEMS property_tests assertion_contracts concurrency_stress allocation_tests)
+    foreach(target IN ITEMS property_tests assertion_contracts concurrency_stress allocation_tests output_regressions)
         add_executable(chtest_${target} test/${target}.cpp)
         chtest_configure_target(chtest_${target})
     endforeach()
@@ -93,6 +93,8 @@ if(CHTEST_BUILD_TESTS)
     add_test(NAME assertion_contracts COMMAND chtest_assertion_contracts)
     add_test(NAME concurrency_stress COMMAND chtest_concurrency_stress)
     add_test(NAME allocation_contracts COMMAND chtest_allocation_tests)
+    add_test(NAME output_regressions COMMAND chtest_output_regressions)
+    set_tests_properties(output_regressions PROPERTIES LABELS "contracts;stress" TIMEOUT 60)
     add_test(NAME installed_package COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}" "-DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/package-verification"
         "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}" "-DGENERATOR=${CMAKE_GENERATOR}"

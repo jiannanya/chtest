@@ -42,6 +42,10 @@ TEST_CASE("buffered output") {
     const std::string line(127, 'x');
     for (int i = 0; i < 100000; ++i) chtest::ts_cout() << line << '\n';
 }
+TEST_CASE("formatted output") {
+    const std::string payload(8192, 'x');
+    for (int i = 0; i < 10000; ++i) chtest::ts_cout() << i << ':' << payload << '\n';
+}
 const std::vector<std::string> subcase_names = [] {
     std::vector<std::string> names;
     for (int i = 0; i < 512; ++i) names.push_back("long subcase name used to expose repeated allocation during matching: " + std::to_string(i));
@@ -72,6 +76,14 @@ double peak_memory_mib() {
 }
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "assertions";
+    int repetitions = 1;
+    if (argc > 2) {
+        const std::string_view value(argv[2]);
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), repetitions);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || repetitions < 1 || repetitions > 1000) return 2;
+    }
+    if (mode != "assertions" && mode != "params" && mode != "scheduler" && mode != "output" &&
+        mode != "output-small-buffer" && mode != "output-formatted" && mode != "subcases") return 2;
     std::atomic<int> active{0}, peak{0};
     if (mode == "scheduler") {
         for (int i = 0; i < 4096; ++i) {
@@ -85,8 +97,11 @@ int main(int argc, char** argv) {
         }
     }
     const std::string pattern = mode == "subcases" ? "many subcases" : mode == "scheduler" ? "scheduled" : mode == "params" ? "parameter" :
-                                mode == "output" ? "buffered output" : "quiet binary";
-    std::vector<std::string> options{"benchmark", "--quiet", "--no-color", "--test", pattern, "--threads", mode == "scheduler" ? "4" : "1"};
+        mode == "output-formatted" ? "formatted output" :
+        (mode == "output" || mode == "output-small-buffer") ? "buffered output" : "quiet binary";
+    std::vector<std::string> options{"benchmark", "--quiet", "--no-color", "--test", pattern, "--threads", mode == "scheduler" ? "4" : "1",
+                                     "--repeat", std::to_string(repetitions)};
+    if (mode == "output-small-buffer") { options.emplace_back("--buffer-limit"); options.emplace_back("1024"); }
     std::vector<char*> arguments;
     for (auto& option : options) arguments.push_back(option.data());
     std::size_t output_bytes = 0;

@@ -115,6 +115,7 @@ TEST_CASE("mock: move only arguments and reference returns") {
     mock.setImpl([](std::unique_ptr<int> value) { return *value; });
     CHECK_EQ(mock(std::make_unique<int>(11)), 11);
     CHECK_CALLED_TIMES(mock, 1);
+    CHECK(mock.getCalls().empty());
     CHECK_THROWS(mock.setRecordCalls(true));
     chtest::MockFunction<int&()> reference;
     CHECK_THROWS(reference());
@@ -122,6 +123,33 @@ TEST_CASE("mock: move only arguments and reference returns") {
     reference.setImpl([&]() -> int& { return value; });
     reference() = 9;
     CHECK_EQ(value, 9);
+}
+
+TEST_CASE("mock: copy constructible nonassignable history") {
+    struct Value {
+        int number;
+        explicit Value(int n) : number(n) {}
+        Value(const Value&) = default;
+        Value& operator=(const Value&) = delete;
+        bool operator==(const Value& other) const { return number == other.number; }
+    };
+    chtest::MockFunction<void(const Value&)> mock;
+    mock.reserveCalls(8);
+    for (int i = 0; i < 8; ++i) mock(Value{i});
+    mock.setHistoryLimit(3);
+    const auto calls = mock.getCalls();
+    CHECK_SIZE(calls, 3);
+    for (int i = 0; i < 3; ++i) CHECK_EQ(std::get<0>(calls[static_cast<std::size_t>(i)]).number, i);
+    CHECK(mock.calledWith(Value{1}));
+    CHECK(!mock.calledWith(Value{7}));
+    CHECK_CALLED_TIMES(mock, 8);
+    mock.setHistoryLimit(0);
+    CHECK(mock.getCalls().empty());
+    mock.setHistoryLimit(2);
+    mock(Value{42});
+    CHECK(mock.calledWith(Value{42}));
+    mock.reset(true);
+    CHECK_CALLED_TIMES(mock, 0);
 }
 
 TEST_CASE("mock: concurrent mutable implementation and replacement") {

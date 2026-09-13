@@ -94,21 +94,33 @@ inline void emit_output(std::string_view s) noexcept {
     } catch (...) { output_failed().store(true, std::memory_order_relaxed); }
 }
 inline void append_output(PerCaseBuffer* buffer, std::string_view text) {
+    if (text.empty()) return;
     if (!buffer || tls_in_output_sink) { emit_output(text); return; }
     std::unique_lock<std::mutex> lock(buffer->mtx);
-    if (!buffer->closed && text.size() < buffer->limit &&
-        buffer->buf.size() <= buffer->limit - text.size()) {
-        buffer->buf.append(text.data(), text.size());
-        return;
+    for (;;) {
+        if (buffer->closed || text.size() >= buffer->limit) {
+            std::string ready;
+            ready.swap(buffer->buf);
+            lock.unlock();
+            if (!ready.empty()) emit_output(ready);
+            emit_output(text);
+            return;
+        }
+        if (buffer->buf.size() <= buffer->limit - text.size()) {
+            buffer->buf.append(text.data(), text.size());
+            return;
+        }
+        std::string ready;
+        ready.swap(buffer->buf);
+        // Never invoke user callbacks while holding the buffer mutex.
+        lock.unlock();
+        emit_output(ready);
+        ready.clear();
+        lock.lock();
+        // Reuse flushed storage when no other producer has filled this buffer.
+        // Otherwise recheck room/closure before appending the pending message.
+        if (!buffer->closed && buffer->buf.empty()) buffer->buf.swap(ready);
     }
-    std::string ready;
-    const bool direct = buffer->closed || text.size() >= buffer->limit;
-    ready.swap(buffer->buf);
-    if (!direct) buffer->buf.append(text.data(), text.size());
-    lock.unlock();
-    // Never invoke user callbacks while holding the buffer mutex.
-    if (!ready.empty()) emit_output(ready);
-    if (direct) emit_output(text);
 }
 class ts_ostream_proxy {
     char small_text[256];
@@ -142,6 +154,12 @@ class ts_ostream_proxy {
         }
         return *stream;
     }
+    template <typename Stream>
+    static auto append_formatted(Stream& value, int) -> decltype(value.view(), void()) {
+        append_output(tls_case_out, value.view());
+    }
+    template <typename Stream>
+    static void append_formatted(Stream& value, long) { append_output(tls_case_out, value.str()); }
 public:
     // Text-only messages need no locale, stream buffer, or final str() copy.
     ts_ostream_proxy& operator<<(std::string_view value) {
@@ -164,7 +182,10 @@ public:
     ts_ostream_proxy& operator<<(std::ostream& (*manip)(std::ostream&)) { formatted() << manip; return *this; }
     ~ts_ostream_proxy() noexcept {
         try {
-            if (stream) append_output(tls_case_out, stream->str());
+            if (stream) {
+                if (!*stream) output_failed().store(true, std::memory_order_relaxed);
+                append_formatted(*stream, 0);
+            }
             else append_output(tls_case_out, text_view());
         }
         catch (...) { output_failed().store(true, std::memory_order_relaxed); }
@@ -515,7 +536,7 @@ std::string to_string_any(const T& v) {
         try {
             std::ostringstream oss;
             oss << v;
-            return oss ? oss.str() : "<formatting failed>";
+            return oss ? std::move(oss).str() : "<formatting failed>";
         } catch (const AssertionFailure&) { throw; }
         catch (const std::exception&) { return "<formatting threw>"; }
         catch (...) { return "<formatting threw>"; }
@@ -805,7 +826,12 @@ public:
         }
     }
     std::size_t timesCalled() const { std::lock_guard<std::mutex> lock(mtx); return call_count; }
-    std::vector<Call> getCalls() const { std::lock_guard<std::mutex> lock(mtx); return calls; }
+    std::vector<Call> getCalls() const {
+        if constexpr (can_record) {
+            std::lock_guard<std::mutex> lock(mtx);
+            return calls;
+        } else return {}; // Move-only arguments always use count-only mode.
+    }
     template <typename... Values> bool calledWith(const Values&... values) const {
         const auto expected = std::tie(values...);
         std::lock_guard<std::mutex> lock(mtx);
@@ -818,7 +844,7 @@ public:
     void setHistoryLimit(std::size_t count) {
         std::lock_guard<std::mutex> lock(mtx);
         history_limit = count;
-        if (calls.size() > count) calls.erase(calls.begin() + count, calls.end());
+        while (calls.size() > count) calls.pop_back();
         if (calls.capacity() > count) calls.shrink_to_fit();
     }
     void setRecordCalls(bool enabled) {
@@ -1350,12 +1376,13 @@ inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
                     for (std::size_t i = 0; i < test.subcases.size(); ++i) {
                         if (abort->load(std::memory_order_relaxed)) break;
                         // Nested discovery can reallocate the vector; keep this path stable.
-                        const auto subcase = test.subcases[i];
-                        if (!cfg.quiet) print_subcase_start(subcase.name);
+                        const auto path = test.subcases[i].path;
+                        const auto& name = path.back().name;
+                        if (!cfg.quiet) print_subcase_start(name);
                         agg().subcases.fetch_add(1, std::memory_order_relaxed);
                         route().mode = SubcaseMode::Active;
-                        route().active_path = &subcase.path;
-                        route().active_name = subcase.name.c_str();
+                        route().active_path = &path;
+                        route().active_name = name.c_str();
                         route().path.clear();
                         route().entered_depth = 0;
                         route().in_subcase = false;
@@ -1363,7 +1390,7 @@ inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
                         invoke_guarded(test.fn, "uncaught exception in subcase");
                         route().active_path = nullptr;
                         route().active_name = nullptr;
-                        if (cfg.timings) agg().subcase_times.push_back({test.name + " :: " + subcase.name, elapsed_ms(subcase_start)});
+                        if (cfg.timings) agg().subcase_times.push_back({test.name + " :: " + name, elapsed_ms(subcase_start)});
                     }
                 }
             }, "exception while executing case");
@@ -1414,7 +1441,8 @@ inline int run(int argc, char** argv) {
     current_quiet() = cfg.quiet;
     auto& tests = registry();
     std::vector<std::size_t> indices;
-    indices.reserve(tests.size());
+    if (cfg.pattern.empty() && !cfg.untagged_only && cfg.any_tags.empty() &&
+        cfg.all_tags.empty() && cfg.excluded_tags.empty()) indices.reserve(tests.size());
     const auto equal_folded = [](char a, char b) {
         return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
     };
