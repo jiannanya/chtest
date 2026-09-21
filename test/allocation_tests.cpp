@@ -7,6 +7,14 @@
 // allocating in the tracker itself. This is not a substitute for ASan/LSan.
 namespace allocation_probe {
 struct Header { void* base; std::size_t bytes; bool tracked; };
+// A replacement global `operator new` must hand out memory aligned for any type
+// the language considers not over-aligned, which is the platform's default new
+// alignment - not `alignof(std::max_align_t)`, which is only 8 on some targets.
+#if defined(__STDCPP_DEFAULT_NEW_ALIGNMENT__)
+constexpr std::size_t default_new_alignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+#else
+constexpr std::size_t default_new_alignment = alignof(std::max_align_t);
+#endif
 inline thread_local bool enabled = false;
 inline thread_local std::size_t large_threshold = 1024;
 inline std::atomic<std::size_t> allocations{0}, large_allocations{0}, live{0}, peak{0};
@@ -42,7 +50,7 @@ struct Scope {
     ~Scope() { enabled = false; }
 };
 }
-void* operator new(std::size_t bytes) { return allocation_probe::allocate(bytes, alignof(std::max_align_t)); }
+void* operator new(std::size_t bytes) { return allocation_probe::allocate(bytes, allocation_probe::default_new_alignment); }
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
 void operator delete(void* pointer) noexcept { allocation_probe::release(pointer); }
 void operator delete[](void* pointer) noexcept { allocation_probe::release(pointer); }

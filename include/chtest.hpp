@@ -18,14 +18,15 @@
 #include <thread>
 #include <mutex>
 #include <cstdint>
+#include <cstring>
 #include <charconv>
 #include <condition_variable>
 #include <cctype>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
-#include <unordered_map>
 #include <cmath>
 #include <iterator>
 #include <string_view>
@@ -49,42 +50,40 @@ inline thread_local std::shared_ptr<std::atomic<count_type>> tls_case_fail_count
 inline thread_local std::atomic<count_type>* tls_case_fail_count = nullptr;
 inline thread_local bool tls_in_output_sink = false;
 inline std::mutex& global_out_mutex() { static std::mutex m; return m; }
-inline std::atomic<bool>& output_failed() { static std::atomic<bool> failed{false}; return failed; }
+// Constant-initialized process flags: reading them costs one load instead of the
+// initialization guard a function-local static would need on every assertion.
+inline std::atomic<bool> global_output_failed{false};
+inline std::atomic<bool>& output_failed() { return global_output_failed; }
 
 using output_sink_t = std::function<void(std::string_view)>;
-#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
-inline std::atomic<std::shared_ptr<output_sink_t>>& output_sink() {
-    static std::atomic<std::shared_ptr<output_sink_t>> sink;
-    return sink;
-}
-inline std::shared_ptr<output_sink_t> load_output_sink() { return output_sink().load(std::memory_order_acquire); }
-#else
-inline std::shared_ptr<output_sink_t>& output_sink() {
+// The sink is read under the same recursive mutex that serializes emission, so a
+// single locked read replaces a lock-free pointer load that itself takes a global
+// lock. A sink may still replace or clear itself while running: emission keeps its
+// own copy alive for the call.
+inline std::recursive_mutex& output_mutex() { static std::recursive_mutex m; return m; }
+inline std::shared_ptr<output_sink_t>& output_sink_slot() {
     static std::shared_ptr<output_sink_t> sink;
     return sink;
 }
 inline std::shared_ptr<output_sink_t> load_output_sink() {
-    return std::atomic_load_explicit(&output_sink(), std::memory_order_acquire);
+    std::lock_guard<std::recursive_mutex> lock(output_mutex());
+    return output_sink_slot();
 }
-#endif
 inline void set_output_sink(output_sink_t sink) {
     auto next = sink ? std::make_shared<output_sink_t>(std::move(sink)) : std::shared_ptr<output_sink_t>{};
-#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
-    output_sink().store(std::move(next), std::memory_order_release);
-#else
-    std::atomic_store_explicit(&output_sink(), std::move(next), std::memory_order_release);
-#endif
+    std::lock_guard<std::recursive_mutex> lock(output_mutex());
+    output_sink_slot() = std::move(next);
 }
 inline void clear_output_sink() { set_output_sink({}); }
 inline void emit_output(std::string_view s) noexcept {
     if (s.empty()) return;
     // Recursive serialization permits a sink to log through ts_cout(). Nested
     // output goes to stdout so a sink cannot recursively call itself forever.
-    static std::recursive_mutex mutex;
     try {
-        std::lock_guard<std::recursive_mutex> lock(mutex);
-        auto sink = load_output_sink();
-        if (sink && !tls_in_output_sink) {
+        std::lock_guard<std::recursive_mutex> lock(output_mutex());
+        const bool in_sink = tls_in_output_sink;
+        auto sink = output_sink_slot();
+        if (sink && !in_sink) {
             struct Guard { bool& flag; Guard(bool& f) : flag(f) { flag = true; } ~Guard() { flag = false; } } guard(tls_in_output_sink);
             (*sink)(s);
         } else {
@@ -123,10 +122,35 @@ inline void append_output(PerCaseBuffer* buffer, std::string_view text) {
     }
 }
 class ts_ostream_proxy {
+    // Appends formatted characters straight into the message buffer. Overriding
+    // xsputn stores a block with a single append instead of one overflow call per
+    // character, which also removes the repeated growth of an internal stream
+    // buffer and the final whole-message copy.
+    struct appending_buffer : std::streambuf {
+        std::string* target = nullptr;
+        explicit appending_buffer(std::string* storage) : target(storage) {}
+    protected:
+        int_type overflow(int_type ch) override {
+            if (!traits_type::eq_int_type(ch, traits_type::eof()))
+                target->push_back(traits_type::to_char_type(ch));
+            return traits_type::not_eof(ch);
+        }
+        std::streamsize xsputn(const char* data, std::streamsize count) override {
+            target->append(data, static_cast<std::size_t>(count));
+            return count;
+        }
+    };
     char small_text[256];
     std::size_t small_size = 0;
     std::string text;
-    std::optional<std::ostringstream> stream;
+    // Both the stream buffer and the stream are created in place on first use:
+    // constructing a streambuf copies the global locale, which text-only messages
+    // must not pay for. Both storages append to `text`, so text_view() is the
+    // complete message in every state.
+    alignas(appending_buffer) unsigned char buffer_storage[sizeof(appending_buffer)];
+    appending_buffer* buffer = nullptr;
+    alignas(std::ostream) unsigned char stream_storage[sizeof(std::ostream)];
+    std::ostream* stream_instance = nullptr;
     std::string_view text_view() const {
         return text.empty() ? std::string_view(small_text, small_size) : std::string_view(text);
     }
@@ -144,26 +168,31 @@ class ts_ostream_proxy {
             text.append(value.data(), value.size());
         }
     }
-    std::ostringstream& formatted() {
-        if (!stream) {
-            stream.emplace();
-            const auto prefix = text_view();
-            if (!prefix.empty()) stream->write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
-            std::string().swap(text);
-            small_size = 0;
+    std::ostream& formatted() {
+        if (!stream_instance) {
+            // The pending inline prefix becomes the head of the stream's target.
+            if (small_size) { text.append(small_text, small_size); small_size = 0; }
+            buffer = ::new (static_cast<void*>(buffer_storage)) appending_buffer(&text);
+            stream_instance = ::new (static_cast<void*>(stream_storage)) std::ostream(buffer);
         }
-        return *stream;
+        return *stream_instance;
     }
-    template <typename Stream>
-    static auto append_formatted(Stream& value, int) -> decltype(value.view(), void()) {
-        append_output(tls_case_out, value.view());
+    // A healthy stream with no pending width writes the operand bytes unchanged,
+    // so the sentry/padding path can be skipped without changing output.
+    bool plain_insertion() const {
+        return stream_instance && stream_instance->good() && stream_instance->width() == 0;
     }
-    template <typename Stream>
-    static void append_formatted(Stream& value, long) { append_output(tls_case_out, value.str()); }
 public:
+    ts_ostream_proxy() = default;
+    // The in-place stream and the message buffer must not be duplicated or moved.
+    ts_ostream_proxy(const ts_ostream_proxy&) = delete;
+    ts_ostream_proxy& operator=(const ts_ostream_proxy&) = delete;
+    ts_ostream_proxy(ts_ostream_proxy&&) = delete;
+    ts_ostream_proxy& operator=(ts_ostream_proxy&&) = delete;
     // Text-only messages need no locale, stream buffer, or final str() copy.
     ts_ostream_proxy& operator<<(std::string_view value) {
-        if (stream) *stream << value;
+        if (plain_insertion()) { text.append(value.data(), value.size()); return *this; }
+        if (stream_instance) *stream_instance << value;
         else append_text(value);
         return *this;
     }
@@ -174,7 +203,8 @@ public:
         return *this;
     }
     ts_ostream_proxy& operator<<(char value) {
-        if (stream) *stream << value;
+        if (plain_insertion()) { text.push_back(value); return *this; }
+        if (stream_instance) *stream_instance << value;
         else append_text(std::string_view(&value, 1));
         return *this;
     }
@@ -182,11 +212,15 @@ public:
     ts_ostream_proxy& operator<<(std::ostream& (*manip)(std::ostream&)) { formatted() << manip; return *this; }
     ~ts_ostream_proxy() noexcept {
         try {
-            if (stream) {
-                if (!*stream) output_failed().store(true, std::memory_order_relaxed);
-                append_formatted(*stream, 0);
+            if (stream_instance) {
+                const bool healthy = static_cast<bool>(*stream_instance);
+                std::destroy_at(stream_instance);
+                stream_instance = nullptr;
+                std::destroy_at(buffer);
+                buffer = nullptr;
+                if (!healthy) output_failed().store(true, std::memory_order_relaxed);
             }
-            else append_output(tls_case_out, text_view());
+            append_output(tls_case_out, text_view());
         }
         catch (...) { output_failed().store(true, std::memory_order_relaxed); }
     }
@@ -290,8 +324,10 @@ struct SubcaseId {
     }
 };
 struct Subcase {
-    std::string name;
+    // The leaf id at path.back() is also the display name; storing it twice would
+    // duplicate every discovered name.
     std::vector<SubcaseId> path;
+    const SubcaseId& leaf() const { return path.back(); }
 };
 
 struct TestCase {
@@ -368,7 +404,59 @@ TEST_CASE_SKIP_IF_IMPL(NAME, PRED, CH_TEST_UNIQUE_NAME(CH_TEST_FN), CH_TEST_UNIQ
 
 // ---------- Global subcase routing state ----------
 enum class SubcaseMode { Normal, Discovery, Active };
-using SubcaseIndex = std::unordered_multimap<std::size_t, std::size_t>;
+
+// Maps a path hash to vector positions during discovery. A flat, open-addressed
+// table keeps one contiguous allocation instead of a node per entry, so cases
+// with hundreds of subcases avoid per-entry allocation and pointer chasing.
+class SubcaseIndex {
+    struct Slot {
+        std::size_t hash = 0;
+        std::size_t position = 0; // zero marks an empty slot; holds position + 1
+    };
+    std::vector<Slot> slots_;
+    std::size_t count_ = 0;
+    static std::size_t slots_for(std::size_t entries) {
+        std::size_t slots = 8;
+        while (slots < entries * 2) slots *= 2;
+        return slots;
+    }
+    void rehash(std::size_t slots) {
+        std::vector<Slot> grown(slots);
+        for (const auto& slot : slots_) {
+            if (!slot.position) continue;
+            std::size_t index = slot.hash & (slots - 1);
+            while (grown[index].position) index = (index + 1) & (slots - 1);
+            grown[index] = slot;
+        }
+        slots_.swap(grown);
+    }
+public:
+    bool empty() const { return count_ == 0; }
+    std::size_t size() const { return count_; }
+    // Prepares room for `entries` positions at a load factor of at most one half.
+    void reserve(std::size_t entries) {
+        const auto slots = slots_for(entries);
+        if (slots_.size() < slots) rehash(slots);
+    }
+    void insert(std::size_t hash, std::size_t position) {
+        if (slots_.empty() || (count_ + 1) * 2 > slots_.size()) reserve(count_ + 1);
+        std::size_t index = hash & (slots_.size() - 1);
+        while (slots_[index].position) index = (index + 1) & (slots_.size() - 1);
+        slots_[index] = Slot{hash, position + 1};
+        ++count_;
+    }
+    // Calls `visit(position)` for every recorded position with this hash, stopping
+    // when it returns true. Linear probing guarantees an empty slot ends the
+    // cluster, and nothing is ever erased.
+    template <typename Visit>
+    void for_candidates(std::size_t hash, Visit&& visit) const {
+        if (slots_.empty()) return;
+        const std::size_t mask = slots_.size() - 1;
+        for (std::size_t index = hash & mask; slots_[index].position; index = (index + 1) & mask) {
+            if (slots_[index].hash == hash && visit(slots_[index].position - 1)) return;
+        }
+    }
+};
 
 struct RouteState {
     SubcaseMode mode = SubcaseMode::Normal;
@@ -399,14 +487,21 @@ inline std::size_t subcase_path_hash(const std::vector<SubcaseId>& path) {
     for (const auto& id : path) hash = subcase_hash_append(hash, id.name, id.file, id.line);
     return hash;
 }
-inline bool subcase_enter(const char* name, const char* file = "", int line = 0) {
-    auto& rt = route();
-    const auto matches = [&](const SubcaseId& id) {
-        return id.line == line && std::string_view(id.name) == name &&
-               (id.file == file || std::string_view(id.file) == file);
-    };
+// Compares a stored id with the caller's source location. The line short-circuits
+// the common mismatch, and the name is compared in a single pass that never reads
+// past either string's terminator.
+inline bool subcase_id_matches(const SubcaseId& id, const char* name, const char* file, int line) {
+    if (id.line != line) return false;
+    if (std::strcmp(id.name.c_str(), name) != 0) return false;
+    // Pointer equality holds for the same `__FILE__` literal; content is the fallback.
+    return id.file == file || std::string_view(id.file) == file;
+}
+// Takes the routing state by reference so one caller-side lookup serves the whole
+// decision; every sibling subcase statement re-evaluates this in replays.
+inline bool subcase_enter(RouteState& rt, const char* name, const char* file = "", int line = 0) {
     if (rt.mode == SubcaseMode::Active && rt.active_path && rt.path.size() < rt.active_path->size()) {
-        if (rt.entered_depth > rt.path.size() || !matches((*rt.active_path)[rt.path.size()])) return false;
+        if (rt.entered_depth > rt.path.size() ||
+            !subcase_id_matches((*rt.active_path)[rt.path.size()], name, file, line)) return false;
         rt.entered_depth = rt.path.size() + 1;
         return true;
     }
@@ -414,7 +509,7 @@ inline bool subcase_enter(const char* name, const char* file = "", int line = 0)
                            (rt.mode == SubcaseMode::Active && rt.in_subcase))) {
         auto& subcases = rt.current_case->subcases;
         const auto same_path = [&](const Subcase& sc) {
-            return sc.path.size() == rt.path.size() + 1 && matches(sc.path.back()) &&
+            return sc.path.size() == rt.path.size() + 1 && subcase_id_matches(sc.leaf(), name, file, line) &&
                    std::equal(rt.path.begin(), rt.path.end(), sc.path.begin());
         };
         // Small cases keep the allocation-free linear path. Large discoveries
@@ -424,38 +519,54 @@ inline bool subcase_enter(const char* name, const char* file = "", int line = 0)
         std::size_t hash = 0;
         if (indexed) {
             if (index->empty()) {
-                index->reserve(subcases.size() * 2);
+                index->reserve(subcases.size());
                 for (std::size_t i = 0; i < subcases.size(); ++i)
-                    index->emplace(subcase_path_hash(subcases[i].path), i);
+                    index->insert(subcase_path_hash(subcases[i].path), i);
             }
             hash = subcase_hash_append(subcase_path_hash(rt.path), name, file, line);
-            const auto range = index->equal_range(hash);
-            for (auto found = range.first; found != range.second; ++found)
-                if (same_path(subcases[found->second])) return false;
+            bool duplicate = false;
+            index->for_candidates(hash, [&](std::size_t position) {
+                if (same_path(subcases[position])) { duplicate = true; return true; }
+                return false;
+            });
+            if (duplicate) return false;
         } else if (std::any_of(subcases.begin(), subcases.end(), same_path)) return false;
         auto path = rt.path;
         path.push_back({name, file, line});
-        subcases.push_back({name, std::move(path)});
-        if (indexed) index->emplace(hash, subcases.size() - 1);
+        subcases.push_back({std::move(path)});
+        if (indexed) index->insert(hash, subcases.size() - 1);
     }
     return rt.mode == SubcaseMode::Active && !rt.active_path && rt.active_name &&
            std::string_view(rt.active_name) == name;
 }
 struct ScopedSubcaseFlag {
     bool active = true;
-    bool previous = route().in_subcase;
     bool pushed = false;
-    ScopedSubcaseFlag() { route().in_subcase = true; }
-    ScopedSubcaseFlag(const char* name, const char* file, int line) : active(subcase_enter(name, file, line)) {
+    bool touched = false;
+    bool previous = false;
+    ScopedSubcaseFlag() {
+        auto& rt = route();
+        previous = rt.in_subcase;
+        rt.in_subcase = true;
+        touched = true;
+    }
+    ScopedSubcaseFlag(const char* name, const char* file, int line) {
+        // One routing lookup per guard, and none at all on destruction unless this
+        // guard entered: a guard that declined changed no routing state.
+        auto& rt = route();
+        previous = rt.in_subcase;
+        active = subcase_enter(rt, name, file, line);
         if (active) {
-            route().path.push_back({name, file, line});
-            route().in_subcase = true;
-            pushed = true;
+            rt.path.push_back({name, file, line});
+            rt.in_subcase = true;
+            pushed = touched = true;
         }
     }
     ~ScopedSubcaseFlag() {
-        if (pushed) route().path.pop_back();
-        route().in_subcase = previous;
+        if (!touched) return;
+        auto& rt = route();
+        if (pushed) rt.path.pop_back();
+        rt.in_subcase = previous;
     }
 };
 struct AssertionFailure : std::exception {
@@ -897,7 +1008,8 @@ inline void record_check(bool ok, const char* file, int line, std::string_view e
 }
 
 
-inline bool& current_quiet() { static bool quiet = false; return quiet; }
+inline bool global_quiet = false;
+inline bool& current_quiet() { return global_quiet; }
 template <typename F> bool invoke_guarded(F&& fn, const char* description) {
     try { std::forward<F>(fn)(); return true; }
     catch (const AssertionFailure&) { return false; }
@@ -1373,15 +1485,18 @@ inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
             invoke_guarded([&] {
                 const bool discovered = invoke_guarded(test.fn, "uncaught exception in case discovery");
                 if (discovered && !abort->load(std::memory_order_relaxed)) {
+                    // One buffer serves every replay, so only its elements are
+                    // copied: nested discovery can still reallocate the case's
+                    // own vector while this path must stay stable.
+                    std::vector<SubcaseId> active_path;
                     for (std::size_t i = 0; i < test.subcases.size(); ++i) {
                         if (abort->load(std::memory_order_relaxed)) break;
-                        // Nested discovery can reallocate the vector; keep this path stable.
-                        const auto path = test.subcases[i].path;
-                        const auto& name = path.back().name;
+                        active_path = test.subcases[i].path;
+                        const auto& name = active_path.back().name;
                         if (!cfg.quiet) print_subcase_start(name);
                         agg().subcases.fetch_add(1, std::memory_order_relaxed);
                         route().mode = SubcaseMode::Active;
-                        route().active_path = &path;
+                        route().active_path = &active_path;
                         route().active_name = name.c_str();
                         route().path.clear();
                         route().entered_depth = 0;
