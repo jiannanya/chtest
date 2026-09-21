@@ -105,6 +105,16 @@ void fast_paths() {
 #else
     expect(bytes == 14000 && allocation_probe::allocations == 0, "inline text output allocates no heap memory");
 #endif
+
+    // Integer operands are spelled directly, so a numeric message needs neither a
+    // stream nor any heap memory once the locale probe has run.
+    chtest::ts_cout() << 0;
+    bytes = 0;
+    {
+        allocation_probe::Scope scope;
+        for (int i = 0; i < 1000; ++i) chtest::ts_cout() << i;
+    }
+    expect(bytes == 2890 && allocation_probe::allocations == 0, "integer messages format without a stream or heap memory");
     chtest::clear_output_sink();
 }
 void mock_memory() {
@@ -224,6 +234,21 @@ void repeated_runs() {
     }
     std::cout << "retained run metadata bytes=" << retained << '\n';
 }
+void storage_reuse() {
+    verification::reset();
+    for (int i = 0; i < 64; ++i) verification::add("short case " + std::to_string(i), [] { CHECK(true); });
+    chtest::set_output_sink([](std::string_view) {});
+    expect(verification::run() == 0 && chtest::agg().cases == 64, "warm up the recycled case storage");
+    chtest::reset_aggregates();
+    {
+        allocation_probe::Scope scope;
+        expect(verification::run() == 0 && chtest::agg().cases == 64, "repeated short cases run");
+    }
+    std::cout << "short-case run allocations=" << allocation_probe::allocations << '\n';
+    expect(allocation_probe::allocations <= 16, "short cases allocate only fixed run metadata, not per-case storage");
+    expect(allocation_probe::live == 0, "recycled case storage is released when the run ends");
+    verification::reset();
+}
 void sparse_filters() {
     verification::reset();
     for (int i = 0; i < 4096; ++i)
@@ -253,6 +278,7 @@ int main() {
         replay_storage();
         mock_memory();
         repeated_runs();
+        storage_reuse();
         sparse_filters();
     });
 }

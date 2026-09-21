@@ -280,8 +280,9 @@ chtest::clear_output_sink();
 
 `ts_cout()` builds one message and appends it atomically. Output is buffered per
 case, with a default 64 KiB limit. Large cases flush in bounded chunks; chunks from
-concurrent large cases can interleave. Individual messages can exceed the limit
-and are emitted directly. Sink callbacks are serialized, can be replaced safely,
+concurrent large cases can interleave. Messages that exceed the limit, and messages
+of at least 4 KiB, are emitted directly instead of being copied into the case
+buffer. Sink callbacks are serialized, can be replaced safely,
 and must consume/copy the view before returning. Sink exceptions make the run fail
 without throwing from output destructors. Reentrant sink logging falls back to
 stdout. `--no-buffer` bypasses case buffers; it does not change process-wide C I/O

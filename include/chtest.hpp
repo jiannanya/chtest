@@ -92,12 +92,17 @@ inline void emit_output(std::string_view s) noexcept {
         }
     } catch (...) { output_failed().store(true, std::memory_order_relaxed); }
 }
+// A message this large pays for its own sink call: copying it into the case
+// buffer costs at least as much as the call itself, and emitting it right away
+// never keeps the bytes alive in the buffer. Smaller messages still coalesce
+// into bounded chunks.
+inline constexpr std::size_t direct_message_threshold = 4096;
 inline void append_output(PerCaseBuffer* buffer, std::string_view text) {
     if (text.empty()) return;
     if (!buffer || tls_in_output_sink) { emit_output(text); return; }
     std::unique_lock<std::mutex> lock(buffer->mtx);
     for (;;) {
-        if (buffer->closed || text.size() >= buffer->limit) {
+        if (buffer->closed || text.size() >= buffer->limit || text.size() >= direct_message_threshold) {
             std::string ready;
             ready.swap(buffer->buf);
             lock.unlock();
@@ -121,6 +126,30 @@ inline void append_output(PerCaseBuffer* buffer, std::string_view text) {
         if (!buffer->closed && buffer->buf.empty()) buffer->buf.swap(ready);
     }
 }
+// Integers are spelled directly by std::to_chars while a message has no
+// formatting state, which skips constructing a stream, its buffer, and the
+// locale copies for the most common operand. `ostream << int` only differs from
+// to_chars when the global locale groups digits, and that is decided once here.
+inline std::atomic<int> global_integer_spelling{-1}; // -1 unknown, 0 use the stream, 1 direct
+inline bool direct_integer_spelling() {
+    int observed = global_integer_spelling.load(std::memory_order_relaxed);
+    if (observed < 0) {
+        const std::locale global;
+        const bool plain = std::has_facet<std::numpunct<char>>(global) &&
+                           std::use_facet<std::numpunct<char>>(global).grouping().empty();
+        // Concurrent probes compute the same answer; a relaxed store publishes it.
+        observed = plain ? 1 : 0;
+        global_integer_spelling.store(observed, std::memory_order_relaxed);
+    }
+    return observed == 1;
+}
+// Only the integer types `ostream` spells as plain decimal digits qualify: the
+// character-like types print as characters, and bool stays on the stream path.
+template <typename T> struct is_direct_integer : std::bool_constant<
+    std::is_same_v<T, short> || std::is_same_v<T, unsigned short> ||
+    std::is_same_v<T, int> || std::is_same_v<T, unsigned int> ||
+    std::is_same_v<T, long> || std::is_same_v<T, unsigned long> ||
+    std::is_same_v<T, long long> || std::is_same_v<T, unsigned long long>> {};
 class ts_ostream_proxy {
     // Appends formatted characters straight into the message buffer. Overriding
     // xsputn stores a block with a single append instead of one overflow call per
@@ -208,7 +237,24 @@ public:
         else append_text(std::string_view(&value, 1));
         return *this;
     }
-    template <typename T> ts_ostream_proxy& operator<<(const T& value) { formatted() << value; return *this; }
+    // Direct decimal spelling of an integer keeps short numeric messages in the
+    // inline buffer and out of the stream. A stream already in use means a
+    // manipulator or another type set formatting state, so it takes over.
+    template <typename T, std::enable_if_t<is_direct_integer<T>::value, int> = 0>
+    ts_ostream_proxy& operator<<(T value) {
+        if (!stream_instance && direct_integer_spelling()) {
+            char digits[24];
+            const auto spelled = std::to_chars(digits, digits + sizeof(digits), value);
+            if (spelled.ec == std::errc{}) {
+                append_text(std::string_view(digits, static_cast<std::size_t>(spelled.ptr - digits)));
+                return *this;
+            }
+        }
+        formatted() << value;
+        return *this;
+    }
+    template <typename T, std::enable_if_t<!is_direct_integer<T>::value, int> = 0>
+    ts_ostream_proxy& operator<<(const T& value) { formatted() << value; return *this; }
     ts_ostream_proxy& operator<<(std::ostream& (*manip)(std::ostream&)) { formatted() << manip; return *this; }
     ~ts_ostream_proxy() noexcept {
         try {
@@ -1432,16 +1478,43 @@ public:
 inline double elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
+// Case signals and the per-case output buffer share one allocation, which is
+// recycled per worker thread between cases.
+struct CaseStorage {
+    PerCaseBuffer output;
+    std::atomic<bool> abort{false};
+    std::atomic<count_type> failures{0};
+};
+// One storage per worker thread is recycled between cases: repeated short cases
+// then allocate nothing, and the case output buffer keeps its capacity. A storage
+// is only taken back when nothing else refers to it (a live collector or a child
+// thread that inherited the case context), so reuse never races a straggler.
+inline std::shared_ptr<CaseStorage>& recycled_case_storage() {
+    static thread_local std::shared_ptr<CaseStorage> spare;
+    return spare;
+}
 inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
     ContextRestore restore;
     // Aliasing shared_ptrs retain the same thread-safe lifetimes with one
     // allocation for the case's signals and output storage.
-    struct CaseStorage {
-        PerCaseBuffer output;
-        std::atomic<bool> abort{false};
-        std::atomic<count_type> failures{0};
-    };
-    auto storage = std::make_shared<CaseStorage>();
+    auto storage = std::move(recycled_case_storage());
+    if (!storage) storage = std::make_shared<CaseStorage>();
+    // The buffer is only reachable from here on, but child threads may have
+    // unlocked it earlier, so reset the latch under its mutex.
+    {
+        std::lock_guard<std::mutex> lock(storage->output.mtx);
+        storage->output.closed = false;
+    }
+    struct Recycle {
+        std::shared_ptr<CaseStorage>& storage;
+        ~Recycle() {
+            // Aliases of this case are gone by now; the thread-local keeps that
+            // still point at them are replaced by ContextRestore right after.
+            tls_case_abort = nullptr; tls_case_abort_keep.reset();
+            tls_case_fail_count = nullptr; tls_case_fail_count_keep.reset();
+            if (storage.use_count() == 1) recycled_case_storage() = std::move(storage);
+        }
+    } recycle{storage};
     std::optional<case_output_collector> collector;
     if (!cfg.no_buffer) collector.emplace(std::shared_ptr<PerCaseBuffer>(storage, &storage->output), cfg.buffer_limit);
     auto abort = std::shared_ptr<std::atomic<bool>>(storage, &storage->abort);
@@ -1607,6 +1680,9 @@ inline int run(int argc, char** argv) {
         }
     }
     print_summary(agg().cases, agg().subcases, agg().checks, agg().failures, elapsed_ms(start));
+    // Worker threads released their recycled storage at exit; the calling thread
+    // releases the last one here, so a finished run retains no case storage.
+    recycled_case_storage().reset();
     if (cfg.no_buffer) {
         try {
             std::cout.flush();
