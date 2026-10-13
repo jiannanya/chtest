@@ -82,26 +82,41 @@ int main(int argc, char** argv) {
         const auto parsed = std::from_chars(value.data(), value.data() + value.size(), repetitions);
         if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || repetitions < 1 || repetitions > 1000) return 2;
     }
-    if (mode != "assertions" && mode != "params" && mode != "scheduler" && mode != "output" &&
+    if (mode != "assertions" && mode != "params" && mode != "scheduler" && mode != "scheduler-serial" &&
+        mode != "timed" && mode != "filter" && mode != "output-cases" && mode != "output" &&
         mode != "output-small-buffer" && mode != "output-formatted" && mode != "subcases") return 2;
     std::atomic<int> active{0}, peak{0};
-    if (mode == "scheduler") {
+    if (mode == "scheduler" || mode == "scheduler-serial" || mode == "timed" || mode == "output-cases") {
         for (int i = 0; i < 4096; ++i) {
             chtest::registry().push_back({"scheduled " + std::to_string(i), [&] {
                 const int count = active.fetch_add(1) + 1;
                 int prior = peak.load();
                 while (count > prior && !peak.compare_exchange_weak(prior, count)) {}
                 CHECK(true);
+                if (mode == "output-cases") {
+                    const std::string line(127, 'x');
+                    for (int j = 0; j < 16; ++j) chtest::ts_cout() << line << '\n';
+                }
                 active.fetch_sub(1);
             }, {}, false, {}, 0, 0, nullptr});
         }
     }
-    const std::string pattern = mode == "subcases" ? "many subcases" : mode == "scheduler" ? "scheduled" : mode == "params" ? "parameter" :
+    if (mode == "filter") {
+        for (int i = 0; i < 32768; ++i) {
+            chtest::registry().push_back({"integration/long suite path/component/unselected scenario " + std::to_string(i),
+                                         [] { CHECK(false); }, {}, false, {}, 0, 0, nullptr});
+        }
+        chtest::registry().push_back({"integration/long suite path/component/Selected scenario", [] { CHECK(true); }, {}, false, {}, 0, 0, nullptr});
+    }
+    const std::string pattern = mode == "filter" ? "component/SELECTED" :
+        (mode == "scheduler" || mode == "scheduler-serial" || mode == "timed" || mode == "output-cases") ? "scheduled" :
+        mode == "subcases" ? "many subcases" : mode == "params" ? "parameter" :
         mode == "output-formatted" ? "formatted output" :
         (mode == "output" || mode == "output-small-buffer") ? "buffered output" : "quiet binary";
     std::vector<std::string> options{"benchmark", "--quiet", "--no-color", "--test", pattern, "--threads", mode == "scheduler" ? "4" : "1",
                                      "--repeat", std::to_string(repetitions)};
     if (mode == "output-small-buffer") { options.emplace_back("--buffer-limit"); options.emplace_back("1024"); }
+    if (mode == "timed") { options.emplace_back("--timeout"); options.emplace_back("5000"); }
     std::vector<char*> arguments;
     for (auto& option : options) arguments.push_back(option.data());
     std::size_t output_bytes = 0;

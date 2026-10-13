@@ -1,0 +1,41 @@
+name: Cross-platform verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        standard: [17, 20]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=${{ matrix.standard }} -DCHTEST_BUILD_BENCHMARKS=ON
+      - name: Build
+        run: cmake --build build/ci --config Release --parallel 2
+      - name: Test
+        run: ctest --test-dir build/ci -C Release --output-on-failure --parallel 2
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        options:
+          - -DCHTEST_ENABLE_ASAN=ON -DCHTEST_ENABLE_UBSAN=ON
+          - -DCHTEST_ENABLE_TSAN=ON
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure with Clang
+        run: cmake -S . -B build/sanitized -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.options }}
+      - name: Build
+        run: cmake --build build/sanitized --parallel 2
+      - name: Test
+        run: ctest --test-dir build/sanitized --output-on-failure --parallel 2

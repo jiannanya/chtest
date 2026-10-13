@@ -2,6 +2,7 @@
 #define CH_TEST_HPP
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
 #include <functional>
@@ -289,8 +290,18 @@ struct case_output_collector {
         tls_case_out_keep = std::move(previous_keep);
         try {
             std::string text;
-            { std::lock_guard<std::mutex> lock(buf->mtx); buf->closed = true; text.swap(buf->buf); }
+            {
+                std::lock_guard<std::mutex> lock(buf->mtx);
+                buf->closed = true;
+                if (buf->buf.empty()) return;
+                text.swap(buf->buf);
+            }
             append_output(previous, text);
+            // Recycled case storage can reuse this allocation on the next case.
+            // Keep callbacks outside the lock; closed buffers forward late writes.
+            text.clear();
+            std::lock_guard<std::mutex> lock(buf->mtx);
+            if (text.capacity() > buf->buf.capacity()) buf->buf.swap(text);
         } catch (...) { output_failed().store(true, std::memory_order_relaxed); }
     }
     case_output_collector(const case_output_collector&) = delete;
@@ -1438,42 +1449,72 @@ inline void reset_aggregates() {
     a.case_times.clear(true); a.subcase_times.clear(true); a.slow_case_info.clear(true);
 }
 
-// The test stays on its worker (including environment hooks). A watchdog sets
-// the shared abort flag; it never detaches or destroys a running test's state.
+// A worker reuses its watchdog across attempts and cases. Arming, expiration and
+// disarming share one mutex, so a finished deadline can never abort the next case.
+// Tests and hooks stay on their case worker; the watchdog only sets the flag.
 class AttemptDeadline {
     std::mutex mutex;
     std::condition_variable cv;
-    bool done = false;
+    bool stopped = false, armed = false, expired = false;
+    std::uint64_t generation = 0;
+    std::chrono::steady_clock::time_point deadline;
+    std::atomic<bool>* abort = nullptr;
+    // Declared last: all state exists before the thread can observe it.
     std::thread watchdog;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    int timeout;
-    std::atomic<bool>& abort;
-    std::atomic<bool> expired{false};
-public:
-    AttemptDeadline(int milliseconds, std::atomic<bool>& flag) : timeout(milliseconds), abort(flag) {
-        if (timeout > 0) watchdog = std::thread([this] {
-            std::unique_lock<std::mutex> lock(mutex);
-            if (!cv.wait_until(lock, start + std::chrono::milliseconds(timeout), [this] { return done; })) {
-                expired.store(true, std::memory_order_relaxed);
-                abort.store(true, std::memory_order_relaxed);
-            }
-        });
+    void expire() {
+        expired = true;
+        abort->store(true, std::memory_order_relaxed);
+        armed = false;
     }
-    bool finish() {
-        if (timeout <= 0) return false;
+    void watch() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stopped) {
+            cv.wait(lock, [this] { return stopped || armed; });
+            if (stopped) break;
+            const auto observed = generation;
+            const auto until = deadline;
+            if (!cv.wait_until(lock, until, [this, observed] {
+                    return stopped || !armed || generation != observed;
+                })) expire();
+        }
+    }
+public:
+    AttemptDeadline() = default;
+    AttemptDeadline(int milliseconds, std::atomic<bool>& flag) { start(milliseconds, flag); }
+    void start(int milliseconds, std::atomic<bool>& flag) {
+        finish();
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!done && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout)) {
-                expired.store(true, std::memory_order_relaxed);
-                abort.store(true, std::memory_order_relaxed);
-            }
-            done = true;
+            expired = false;
+            ++generation;
+            abort = &flag;
+            armed = milliseconds > 0;
+            deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+        }
+        if (milliseconds > 0 && !watchdog.joinable()) watchdog = std::thread([this] { watch(); });
+        cv.notify_one();
+    }
+    bool finish() {
+        bool result;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (armed && std::chrono::steady_clock::now() >= deadline) expire();
+            armed = false;
+            abort = nullptr;
+            result = expired;
+        }
+        cv.notify_one();
+        return result;
+    }
+    ~AttemptDeadline() {
+        finish();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopped = true;
         }
         cv.notify_one();
         if (watchdog.joinable()) watchdog.join();
-        return expired.load(std::memory_order_relaxed);
     }
-    ~AttemptDeadline() { finish(); }
 };
 inline double elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1492,6 +1533,12 @@ struct CaseStorage {
 inline std::shared_ptr<CaseStorage>& recycled_case_storage() {
     static thread_local std::shared_ptr<CaseStorage> spare;
     return spare;
+}
+// Context snapshots may keep case storage alive after an invocation. The timer
+// belongs to the worker separately, so snapshots cannot retain idle OS threads.
+inline std::unique_ptr<AttemptDeadline>& worker_deadline() {
+    static thread_local std::unique_ptr<AttemptDeadline> timer;
+    return timer;
 }
 inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
     ContextRestore restore;
@@ -1544,8 +1591,17 @@ inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
         failures->store(0, std::memory_order_relaxed);
         test.subcases.clear();
         SubcaseIndex subcase_index;
-        std::optional<AttemptDeadline> deadline;
-        if (cfg.timeout_ms > 0) deadline.emplace(cfg.timeout_ms, *abort);
+        // Disarm on exceptional exits too, before the case's signals are released.
+        struct FinishDeadline {
+            AttemptDeadline* value = nullptr;
+            ~FinishDeadline() { if (value) value->finish(); }
+        } deadline;
+        if (cfg.timeout_ms > 0) {
+            auto& timer = worker_deadline();
+            if (!timer) timer = std::make_unique<AttemptDeadline>();
+            deadline.value = timer.get();
+            deadline.value->start(cfg.timeout_ms, *abort);
+        }
         route() = RouteState{};
         route().mode = SubcaseMode::Discovery;
         route().current_case = &test;
@@ -1587,7 +1643,7 @@ inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
             if (env) invoke_guarded([&] { env->tearDown(); }, "exception in environment tearDown");
         }
         route() = RouteState{};
-        if (deadline && deadline->finish()) {
+        if (deadline.value && deadline.value->finish()) {
             record_check(false, __FILE__, __LINE__, "case timeout: " + test.name,
                          "exceeded " + std::to_string(cfg.timeout_ms) + "ms (cooperative deadline)", false, cfg.quiet);
             agg().timeouts.fetch_add(1, std::memory_order_relaxed);
@@ -1613,6 +1669,41 @@ inline void execute_case(TestCase& test, const Config& cfg, int repeat_index) {
 }
 
 // ---------- Runner ----------
+// Fold bytes once using the current C locale, then use a Horspool skip table.
+// Names need no temporary lowercase copies, and a failed window can skip several
+// bytes. Rebuilding per run preserves locale changes between runs.
+class FoldedNameFilter {
+    static constexpr std::size_t alphabet_size = std::numeric_limits<unsigned char>::max() + std::size_t{1};
+    std::array<unsigned char, alphabet_size> folded_;
+    std::array<std::size_t, alphabet_size> skip_;
+    std::string pattern_;
+public:
+    explicit FoldedNameFilter(std::string_view pattern) : pattern_(pattern) {
+        if (pattern_.empty()) return;
+        for (std::size_t i = 0; i < alphabet_size; ++i)
+            folded_[i] = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(i)));
+        for (auto& ch : pattern_) ch = static_cast<char>(folded_[static_cast<unsigned char>(ch)]);
+        skip_.fill(pattern_.size());
+        for (std::size_t i = 0; i + 1 < pattern_.size(); ++i)
+            skip_[static_cast<unsigned char>(pattern_[i])] = pattern_.size() - i - 1;
+    }
+    bool matches(std::string_view name) const {
+        if (pattern_.empty()) return true;
+        if (name.size() < pattern_.size()) return false;
+        const auto last = pattern_.size() - 1;
+        const auto end = name.size() - pattern_.size();
+        for (std::size_t offset = 0; ;) {
+            const auto tail = folded_[static_cast<unsigned char>(name[offset + last])];
+            std::size_t remaining = pattern_.size();
+            while (remaining && folded_[static_cast<unsigned char>(name[offset + remaining - 1])] ==
+                                static_cast<unsigned char>(pattern_[remaining - 1])) --remaining;
+            if (!remaining) return true;
+            const auto step = skip_[tail];
+            if (step > end - offset) return false;
+            offset += step;
+        }
+    }
+};
 inline int run(int argc, char** argv) {
     // Global registry/configuration permit one run at a time; never deadlock a
     // nested invocation from a test or an output sink.
@@ -1631,12 +1722,10 @@ inline int run(int argc, char** argv) {
     std::vector<std::size_t> indices;
     if (cfg.pattern.empty() && !cfg.untagged_only && cfg.any_tags.empty() &&
         cfg.all_tags.empty() && cfg.excluded_tags.empty()) indices.reserve(tests.size());
-    const auto equal_folded = [](char a, char b) {
-        return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
-    };
+    const FoldedNameFilter name_filter(cfg.pattern);
     for (std::size_t i = 0; i < tests.size(); ++i) {
         const auto& test = tests[i];
-        if (!cfg.pattern.empty() && std::search(test.name.begin(), test.name.end(), cfg.pattern.begin(), cfg.pattern.end(), equal_folded) == test.name.end()) continue;
+        if (!name_filter.matches(test.name)) continue;
         const auto has_tag = [&](const std::string& tag) { return std::find(test.tags.begin(), test.tags.end(), tag) != test.tags.end(); };
         if (cfg.untagged_only && !test.tags.empty()) continue;
         if (!cfg.any_tags.empty() && std::none_of(cfg.any_tags.begin(), cfg.any_tags.end(), has_tag)) continue;
@@ -1645,7 +1734,9 @@ inline int run(int argc, char** argv) {
         indices.push_back(i);
     }
     if (cfg.shuffle) { std::mt19937 rng(cfg.seed); std::shuffle(indices.begin(), indices.end(), rng); }
-    std::stable_sort(indices.begin(), indices.end(), [&](auto a, auto b) { return tests[a].priority > tests[b].priority; });
+    const auto priority_order = [&](auto a, auto b) { return tests[a].priority > tests[b].priority; };
+    if (!std::is_sorted(indices.begin(), indices.end(), priority_order))
+        std::stable_sort(indices.begin(), indices.end(), priority_order);
     if (cfg.list_all || cfg.list_cases) {
         ts_cout() << "[cases]\n";
         for (const auto index : indices) ts_cout() << "  " << tests[index].name << "\n";
@@ -1683,6 +1774,7 @@ inline int run(int argc, char** argv) {
     // Worker threads released their recycled storage at exit; the calling thread
     // releases the last one here, so a finished run retains no case storage.
     recycled_case_storage().reset();
+    worker_deadline().reset();
     if (cfg.no_buffer) {
         try {
             std::cout.flush();

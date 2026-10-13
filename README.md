@@ -19,7 +19,10 @@ for the build and `-C Release` for CTest.
 | CMake option | Default | Purpose |
 | --- | --- | --- |
 | `CHTEST_BUILD_TESTS` | `ON` | Examples, independent runner regressions, expected-failure tests |
+| `CHTEST_BUILD_BENCHMARKS` | `OFF` | Reproducible performance probes |
 | `CHTEST_ENABLE_ASAN` | `OFF` | AddressSanitizer on project executables |
+| `CHTEST_ENABLE_UBSAN` | `OFF` | UndefinedBehaviorSanitizer on supported toolchains |
+| `CHTEST_ENABLE_TSAN` | `OFF` | ThreadSanitizer in a separate build |
 | `CMAKE_CXX_STANDARD` | `17` | Use `20` to verify C++20 consumers |
 
 ## Integration
@@ -212,9 +215,9 @@ worker.join();
 ```
 
 `--timeout ms` is a cooperative deadline for each complete attempt, including
-environment hooks and subcase replays. One watchdog per active timed attempt sets
-the runner's abort flag. A timeout is counted once, then the runner waits for the
-test and cleanup to return. C++ cannot safely kill arbitrary in-process code:
+environment hooks and subcase replays. A watchdog sets the runner's abort flag.
+A timeout is counted once, then the runner waits for the test and cleanup to return.
+C++ cannot safely kill arbitrary in-process code:
 uncooperative or deadlocked code can exceed the deadline. Watchdogs and user child
 threads are additional to the `--threads` case-worker limit. A custom abort flag
 is independent of the runner's deadline flag.
@@ -345,6 +348,12 @@ CTest also includes:
 - Memory checks for history limits and repeated timed/untimed runs.
 - Independent installed-package consumers in two translation units, using both
   standard and custom header/library installation directories.
+- Randomized name-filter comparisons against the standard-library search,
+  repeated deadline cancellation/rearming, timed retries, and allocation budgets
+  for output buffer reuse across cases.
+
+The CI workflow builds C++17 and C++20 on Linux, macOS and Windows, plus separate
+Clang sanitizer builds on Linux.
 
 ```sh
 ctest --test-dir build/release --output-on-failure -j 4

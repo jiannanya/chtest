@@ -34,7 +34,8 @@ def pin_cpu(cpu):
         raise ValueError("CPU affinity is not supported on this platform")
 
 
-MODES = ("assertions", "params", "scheduler", "output", "output-small-buffer", "output-formatted", "subcases")
+MODES = ("assertions", "params", "scheduler", "scheduler-serial", "timed", "filter", "output-cases",
+         "output", "output-small-buffer", "output-formatted", "subcases")
 
 
 def measure(executable, mode, repetitions=1):
@@ -45,11 +46,15 @@ def measure(executable, mode, repetitions=1):
     for field in result.stdout.strip().split():
         key, value = field.split("=", 1)
         values[key] = value if key == "mode" else float(value)
-    expected_checks = {"assertions": 200000, "params": 512, "scheduler": 4096, "output": 0,
+    expected_checks = {"assertions": 200000, "params": 512, "scheduler": 4096,
+                       "scheduler-serial": 4096, "timed": 4096, "filter": 1, "output-cases": 4096, "output": 0,
                        "output-small-buffer": 0, "output-formatted": 0, "subcases": 512}
     if values.get("mode") != mode or values.get("checks") != expected_checks[mode] * repetitions:
         raise RuntimeError(f"{executable}: unexpected workload for {mode}: {values}")
-    output_bytes = {"output": 12800000, "output-small-buffer": 12800000, "output-formatted": 81978890}
+    if mode == "scheduler" and not 1 <= values.get("peak_cases", 0) <= 4:
+        raise RuntimeError(f"{executable}: case-worker limit violated: {values}")
+    output_bytes = {"output": 12800000, "output-small-buffer": 12800000, "output-formatted": 81978890,
+                    "output-cases": 8388608}
     if mode in output_bytes and values.get("output_bytes", 0) < output_bytes[mode] * repetitions:
         raise RuntimeError(f"{executable}: output workload was not fully emitted")
     return values

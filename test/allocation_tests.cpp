@@ -161,7 +161,8 @@ void buffer_reuse() {
             for (int i = 0; i < 10000; ++i) chtest::append_output(collector.buf.get(), message);
         }
     }
-    std::cout << "buffer payload allocations=" << allocation_probe::large_allocations << '\n';
+    std::cout << "buffer payload allocations=" << allocation_probe::large_allocations
+              << " live bytes=" << allocation_probe::live << '\n';
     expect(received == 1280000, "buffer reuse emits every byte");
     expect(allocation_probe::large_allocations < 16, "serial chunk flushes reuse allocated payload storage");
     expect(allocation_probe::peak < 8192, "reusable buffer keeps a bounded allocation peak");
@@ -269,6 +270,24 @@ void sparse_filters() {
     }
     expect(allocation_probe::peak < 8192, "empty selection does not allocate a registry-sized index");
 }
+void case_buffer_reuse() {
+    verification::reset();
+    const std::string message(128, 'x');
+    for (int i = 0; i < 64; ++i) verification::add("output case", [&] {
+        for (int j = 0; j < 16; ++j) chtest::ts_cout() << message;
+    });
+    std::size_t bytes = 0;
+    chtest::set_output_sink([&](std::string_view text) { bytes += text.size(); });
+    expect(verification::run() == 0, "warm up buffered cases");
+    bytes = 0;
+    {
+        allocation_probe::Scope scope;
+        expect(verification::run() == 0, "buffered cases run with recycled output storage");
+    }
+    expect(bytes >= 64 * 16 * message.size(), "recycled case buffers emit all output");
+    expect(allocation_probe::allocations < 32, "output payload storage is reused across cases");
+    expect(allocation_probe::live == 0, "recycled output capacity is released after the run");
+}
 }
 int main() {
     return verification::main("allocation contracts", [] {
@@ -280,5 +299,6 @@ int main() {
         repeated_runs();
         storage_reuse();
         sparse_filters();
+        case_buffer_reuse();
     });
 }
